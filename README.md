@@ -38,6 +38,7 @@ Install it from AIMP's plug-in manager, or open the `.aimppack` with AIMP. After
 - Windows 10/11 x64
 - Visual Studio 2022 with C++ desktop workload
 - CMake 3.22 or newer
+- Windows PowerShell, used by the packaging target
 - AIMP 5.x
 
 The repository vendors the local dependencies needed to build:
@@ -54,6 +55,8 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target dsp_vst3_audio
 cmake --build build --config Release --target package_aimppack
 ```
+
+The `package_aimppack` target invokes `cmake/PackageAimpPack.ps1`, which stages the DLL and creates the `.aimppack` ZIP package with PowerShell `Compress-Archive`.
 
 The package will be regenerated at:
 
