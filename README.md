@@ -4,6 +4,12 @@ VST3 Bridge for AIMP is a Windows DSP plug-in that hosts a single VST3 effect in
 
 Developed by Ezequiel Casas (Mixomo): https://github.com/Mixomo
 
+![dsp_plugin](assets/dsp.png)
+
+![VST3_Bridge_with_CalCurve_vst3_loaded](assets/dsp2.png)
+
+Featured VST3: [CalCurve by Mixomo](https://github.com/Mixomo/CalCurve) 
+
 ## Current Status
 
 This bridge is experimental. It works well with some VST3 effects, but universal VST3 compatibility is not guaranteed. Some commercial plug-ins assume behavior from full DAWs that AIMP's Winamp-style DSP pipeline cannot provide safely in-process.
