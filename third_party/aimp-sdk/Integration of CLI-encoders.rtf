@@ -1,0 +1,118 @@
+{\rtf1\ansi\ansicpg1251\deff0\nouicompat\deflang1049\deflangfe1049{\fonttbl{\f0\fswiss\fprq2\fcharset204 Calibri;}{\f1\fswiss\fprq2\fcharset0 Calibri;}{\f2\fnil\fcharset2 Symbol;}}
+{\colortbl ;\red155\green0\blue211;\red0\green77\blue187;\red79\green129\blue189;}
+{\*\generator Riched20 10.0.19041}{\*\mmathPr\mdispDef1\mwrapIndent1440 }\viewkind4\uc1 
+\pard\nowidctlpar\sa200\sl276\slmult1\qc\f0\fs36 Integration of command-line based encoders\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1\qj\b\fs22 Overview\par
+\ul\b0\f1\lang1033 First and important\ulnone , the command line encoder \ul MUST\ulnone  supports for 1) std-in (input pipe) 2) streaming mode (length of input stream is unknown).\par
+The command-line based encoder integration is simple AIMP Addons Package that used for all other addons (Refer to the "\f0\lang1049 AIMP \f1\lang1033 A\f0\lang1049 ddon \f1\lang1033 P\f0\lang1049 ackage\f1\lang1033 "\f0\lang1049  \f1\lang1033 article for more information).\b\f0\lang1049\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1\b0\f1\lang1033 Unlike plug-ins, entry-point of the encoder is special configuration template that \ul must be\ulnone  named in following way "\cf1 enc_*.xml\cf0 ":\par
+
+\pard\nowidctlpar\fi284\sl276\slmult1\tx284 enc_test\f0\lang1049  \\ \par
+
+\pard\nowidctlpar\fi568\sl276\slmult1\tx284\f1\lang1033 enc_test\f0\lang1049 .\f1\lang1033 xml\f0\lang1049\tab  - \cf2 general \f1\lang1033 configuration\cf0\f0\lang1049\par
+x64\\*.*\tab\tab  - \cf2 all 64-bit binaries\cf0\par
+*.*\tab\tab  - \cf2 all 32-bit binaries\par
+
+\pard\nowidctlpar\fi568\ri-1778\sl276\slmult1\tx284\cf0 *.*\tab\tab  - \cf2 all other platform independent files (ReadMe.txt, License.pdf, etc)\par
+\cf0\f1\lang1033\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1\qj\b\f0\lang1049 Configuration template\f1\lang1033  is\f0\lang1049 :\par
+
+\pard\nowidctlpar\li284\cf2\b0\fs18 <encoders \par
+\tab\cf3 generator\cf0 =\cf2 "AIMP" \par
+\tab\cf3 version\cf0 =\cf2 "1000" \par
+\tab\cf3 author\cf0 =\cf2 "\cf1 author\cf2 " \par
+\tab\cf3 name\cf0 =\cf2 "\cf1 plugin name\cf2 " \par
+\tab\cf3 info\cf0 =\cf2 "\cf1 plugin description\cf2 "\par
+>\par
+\tab <encoder \cf3 Name\cf0 =\cf2 "\cf1 Encoder Name\cf2 " App\cf0 =\cf2 "\cf1 cmd-line-encoder.exe\cf2 "\f1\lang1033  debug="\cf1 0\cf2 "\f0\lang1049 >\par
+\tab\tab <description>\par
+\tab\tab\tab <inputformats \cf3 type\cf2 ="\cf1 autogen\cf2 ">\par
+\tab\tab\tab\tab <autogen \par
+\f1\lang1033\tab\tab\tab\tab\tab\cf3\f0\lang1049 SampleRates\cf2 ="\cf1 44100;48000\cf2 " \par
+\f1\lang1033\tab\tab\tab\tab\tab\cf3\f0\lang1049 SampleFormats\cf2 ="\cf1 8;16\cf2 " \par
+\f1\lang1033\tab\tab\tab\tab\tab\cf3\f0\lang1049 Channels\cf2 ="\cf1 1;2\cf2 " \par
+\f1\lang1033\tab\tab\tab\tab\f0\lang1049 />\par
+\tab\tab\tab </inputformats>\par
+\tab\tab\tab <inputformats \cf3 type\cf2 ="\cf1\f1\lang1033 list\cf2\f0\lang1049 ">\par
+\f1\lang1033\tab\tab\tab\tab <format\par
+\tab\tab\tab\tab\tab\cf3 Channels\cf2 ="\cf1 2\cf2 "\par
+\tab\tab\tab\tab\tab\cf3 SampleFormat\cf2 ="\cf1 16\cf2 "\par
+\tab\tab\tab\tab\tab\cf3 SampleRate\cf2 ="\cf1 44100\cf2 " />\par
+\tab\tab\tab\tab ...\f0\lang1049\par
+\tab\tab\tab </inputformats>\par
+\tab\tab\tab <property \cf3 name\cf0 =\cf2 "\cf1\f1\lang1033 Ext\cf2\f0\lang1049 " \cf3 value\cf0 =\cf2 "\cf1\f1\lang1033 .mp3\cf2\f0\lang1049 "/>\par
+\f1\lang1033\tab\tab\tab\f0\lang1049 <property \cf3 name\cf0 =\cf2 "\cf1\f1\lang1033 InputMegaByteMax\cf2\f0\lang1049 " \cf3 value\cf0 =\cf2 "\cf1\f1\lang1033 Int64\cf2\f0\lang1049 "/>\par
+\f1\lang1033\tab\tab\tab\f0\lang1049 <property \cf3 name\cf0 =\cf2 "\cf1\f1\lang1033 OutputMegaBytesMax\cf2\f0\lang1049 " \cf3 value\cf0 =\cf2 "\cf1\f1\lang1033 Int64\cf2\f0\lang1049 "/>\par
+\f1\lang1033\tab\tab\tab\f0\lang1049 <property \cf3 name\cf0 =\cf2 "\cf1\f1\lang1033 IgnoreLength\cf2\f0\lang1049 " \cf3 value\cf0 =\cf2 "\cf1\f1\lang1033 1 or 0\cf2\f0\lang1049 "/>\par
+\tab\tab </description>\par
+\tab\tab <presets>\par
+\tab\tab\tab <preset \par
+\tab\tab\tab\tab\cf3 name\cf0 =\cf2 "\cf1 Preset Friendly Name\cf2 " \par
+\tab\tab\tab\tab\cf3 cmdparams\cf0 =\cf2 "\cf1\f1\lang1033 -switch %macro1% %macro2% -output %output%\cf2\f0\lang1049 "\par
+\tab\tab\tab >\par
+\tab\tab\tab\tab <var \cf3 name\cf0 =\cf2 "\cf1 Friendly Name\cf2 " \cf3 cmdparams\cf0 =\cf2 "\cf1 macro\f1\lang1033 1\cf2\f0\lang1049 ">\par
+\tab\tab\tab\tab\tab <val \cf3 name\cf0 =\cf2 "\cf1 Friendly Name\cf2 " \cf3 cmdparams\cf0 =\cf2 "\cf1 macro value\cf2 " />\par
+\tab\tab\tab\tab\tab ...\par
+\tab\tab\tab\tab </var>\par
+\tab\tab\tab\tab <var \cf3 name\cf0 =\cf2 "\cf1 Friendly Name\cf2 " \cf3 cmdparams\cf0 =\cf2 "\cf1 macro\f1\lang1033 2\cf2\f0\lang1049 ">\par
+\tab\tab\tab\tab\tab <val \cf3 name\cf0 =\cf2 "\cf1 Friendly Name\cf2 " \cf3 cmdparams\cf0 =\cf2 "\cf1 macro value\cf2 " />\par
+\tab\tab\tab\tab\tab ...\par
+\tab\tab\tab\tab </var>\par
+\tab\tab\tab </preset>\par
+\f1\lang1033\tab\tab\tab ...\f0\lang1049\par
+\tab\tab </presets>\par
+\tab </encoder>\par
+\tab ...\par
+</encoders>\par
+\cf0\fs22\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1\b Structure\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li720\sl276\slmult1\cf2\b0 encoder\f1\lang1033 s \cf0 - \ul at least one\ulnone  \cf2 encoder\cf0  entry.\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 encoder\cf0  - \ul MUST\ulnone  contains \cf2 description \cf0 and \cf2 presets\cf0  entries.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1136\sl276\slmult1\cf2\b0 debug\cf0  - set to \cf1 1\cf0  to display encoder console output, \ul optional\ulnone .\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li720\sl276\slmult1\cf2\b0 description\cf0  - \ul MUST\ulnone  contains \ul one\ulnone  \cf2 inputformats\cf0  and \ul one or more\ulnone  \cf2 property\cf0  entries.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1070\sl276\slmult1\tx1278\cf2\b0 inputformats\cf0  may be defined in two ways according to value of \cf2 type \cf0 attribute:\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1496\sl276\slmult1\qj\tx1278\cf2\b0 autogen\cf0\b\line\b0 List of supported formats will be generated according to specified lists.\b\line\b0 Here you can specify lists of supported sample rates, sample formats\super 1\nosupersub  and channels.\b\line\super 1 \nosupersub\b0 Refer to \cf2 sampleFormat\cf0  description for details.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1496\sl276\slmult1\tx1278\cf2\b0 list\cf0\b\line\b0 In this case, the \cf2 inputformats\cf0  contains a plain list of the \cf2 format\cf0  entry.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1070\sl276\slmult1\tx1278\cf2\b0 sampleFormat \cf0 may be one of following values: \cf1 8\cf0 , \cf1 16\cf0 , \cf1 24\cf0 , \cf1 24i32\cf0 , \cf1 32\cf0 , \cf1 32f\cf0 .\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 property\cf0\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1496\sl276\slmult1\tx1278\cf2\b0 Ext\cf0  - specifies output file extension, \ul\b REQUIRED\ulnone\b0 .\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 InputMegaByteMax\cf0  - specifies how many bytes can be send into the encoder. \ul Optional\ulnone , default is 4GB (limit of WAVE header that uses for pipe transfering).\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 IgnoreLength\cf0  - specifies that the encoder ignores length defined in WAVE header. Its means, more than 4GB can be transfered via pipe. \b\line\ul\b0 Optional\ulnone , default is 0.\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 OutputMegaBytesMax\cf0  - specifies how many bytes can be written to a file of used format. \b\line\ul\b0 Optional\ulnone , output will be unlimited if property is not specified.\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 ID3\cf0  - set to \cf1 "1"\cf0  if the encoder expects ID3v2 tag header in beginning of data stream. \ul Optional\ulnone , default is 0.\b\par
+{\pntext\f2\'B7\tab}\cf2\b0 RequiresLength\cf0  - set to \cf1 "1"\cf0  if the encoder requires correct length defined in WAVE header. By default, AIMP set length to 0 that usually interpreted by encoders like unknown length.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li710\sl276\slmult1\tx1278\cf2\b0 presets \cf0 - contains \ul at least one\ulnone  \cf2 preset\cf0  entry.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1136\sl276\slmult1\qj\tx1278\cf2\b0 preset\cf0  - \ul MUST\ulnone  contain \cf2 name\cf0  and \cf2 cmdparams\cf0  attributes. The \cf2 name\cf0  attribute specifies friendly name of the preset that will be displayed to user. The \cf2 cmdparams\cf0  attribute specifies command line arguments that will be passed to command line encoder if user selects the preset. \b\line\b0 The command line \ul MUST\ulnone  contains the \cf2 %output%\cf0  macro that will be expanded to an actual output file name. Additionally, it may refers to custom macros which values defines in \cf2 var/val\cf0  entry inside the \cf2 preset\cf0  entry.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1562\sl276\slmult1\qj\tx1278\cf2\b0 var \cf0 - \ul optional\ulnone  entry that defines a custom macro used in command line for the encoder. The \cf2 name\cf0  attribute of the entry defines a friendly name that will be displayed to user. The \cf2 cmdparams \cf0 specifies a macro name. The entry contains \ul at least one\ulnone  \cf2 val\cf0  entry.\b\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li1988\sl276\slmult1\qj\tx1278\cf2\b0 val\cf0  - The \cf2 name\cf0  attribute of the entry defines a friendly name that will be displayed to user. The \cf2 cmdparams \cf0 defines command line arguments that will be used as replacement of macro in command line that passes to the encoder if user selects the entry. \b\line\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1 Example\par
+\b0 Refer to configuration files of the encoders that shipped with the application:\par
+
+\pard{\pntext\f2\'B7\tab}{\*\pn\pnlvlblt\pnf2\pnindent0{\pntxtb\'B7}}\nowidctlpar\fi-360\li720\sa200\sl276\slmult1 <AIMP>\\Plugins\\enc_opus\\enc_opus.xml\par
+{\pntext\f2\'B7\tab}<AIMP>\\Plugins\\enc_tta\\enc_tta.xml\f0\lang1049\par
+
+\pard\nowidctlpar\sl276\slmult1\qj\tx1278\b\f1\lang1033\par
+
+\pard\nowidctlpar\sa200\sl276\slmult1\par
+\par
+\f0\lang1049\par
+\ul\b0\par
+}
+ 
