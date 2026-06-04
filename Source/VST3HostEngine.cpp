@@ -25,8 +25,8 @@ namespace
 
     bool isKnownUnsafePluginPath(const juce::String& path)
     {
-        auto lower = path.toLowerCase();
-        return lower.contains("fabfilter pro-q 4.vst3");
+        juce::ignoreUnused(path);
+        return false;
     }
 
     juce::String describeBuses(const juce::AudioProcessor& processor)

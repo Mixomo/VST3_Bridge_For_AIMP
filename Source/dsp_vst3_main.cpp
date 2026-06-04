@@ -11,6 +11,10 @@
 #define AIMP_VST3_BRIDGE_ENABLE_WINAMP_DSP 1
 #endif
 
+#ifndef AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+#define AIMP_VST3_BRIDGE_OUT_OF_PROCESS 0
+#endif
+
 // ── AIMP Native SDK ──────────────────────────────────────────
 #if AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN
 #include "apiTypes.h"
@@ -22,14 +26,106 @@
 #if AIMP_VST3_BRIDGE_ENABLE_WINAMP_DSP
 #include "winamp_dsp.h"
 #endif
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+#include "OutProcClient.h"
+#else
 #include "VST3HostEngine.h"
 #include "HostWindow.h"
+#endif
 
 // ── Module-level HINSTANCE (safe: no constructor/destructor) ─
 static HINSTANCE g_hInst = nullptr;
 
 namespace
 {
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+    std::mutex g_runtimeMutex;
+    int g_runtimeRefs = 0;
+    OutProcClient g_outProcClient;
+
+    void WriteDebugLog(const char* message)
+    {
+        char tempPath[MAX_PATH] = {};
+        if (GetTempPathA(MAX_PATH, tempPath) == 0)
+            return;
+
+        char logPath[MAX_PATH] = {};
+        if (sprintf_s(logPath, "%sdsp_vst3_bridge.log", tempPath) <= 0)
+            return;
+
+        FILE* file = nullptr;
+        if (fopen_s(&file, logPath, "ab") != 0 || file == nullptr)
+            return;
+
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+        std::fprintf(file, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, message);
+        std::fclose(file);
+    }
+
+    bool StartRuntime()
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeMutex);
+        if (g_runtimeRefs > 0 && g_outProcClient.isRunning())
+        {
+            ++g_runtimeRefs;
+            return true;
+        }
+
+        if (g_runtimeRefs > 0)
+            g_outProcClient.stop();
+
+        if (!g_outProcClient.start(g_hInst))
+        {
+            g_runtimeRefs = 0;
+            WriteDebugLog("Failed to start out-of-process VST3 host");
+            return false;
+        }
+
+        g_runtimeRefs = 1;
+        WriteDebugLog("Out-of-process VST3 host started");
+        return true;
+    }
+
+    void StopRuntime()
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeMutex);
+        if (g_runtimeRefs <= 0)
+            return;
+        if (--g_runtimeRefs > 0)
+            return;
+        char stats[512] = {};
+        sprintf_s(stats,
+                  "Out-of-process pipeline stats: submitted=%llu completed=%llu missed=%llu stale=%llu queueFull=%llu emergencyBypass=%llu clientMaxMicros=%llu clientOver1ms=%llu clientOver3ms=%llu",
+                  static_cast<unsigned long long>(g_outProcClient.getSubmittedBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getCompletedBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getMissedBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getStaleBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getQueueFullBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getEmergencyBypassBlocks()),
+                  static_cast<unsigned long long>(g_outProcClient.getMaxClientCallbackMicros()),
+                  static_cast<unsigned long long>(g_outProcClient.getClientCallbacksOver1ms()),
+                  static_cast<unsigned long long>(g_outProcClient.getClientCallbacksOver3ms()));
+        WriteDebugLog(stats);
+        g_outProcClient.stop();
+        WriteDebugLog("Out-of-process VST3 host stopped");
+    }
+
+    bool IsRuntimeStarted()
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeMutex);
+        return g_runtimeRefs > 0 && g_outProcClient.isRunning();
+    }
+
+    void ShowHostConfig()
+    {
+        if (!IsRuntimeStarted() && !StartRuntime())
+            return;
+        g_outProcClient.showEditor();
+    }
+
+#else
     std::mutex g_runtimeMutex;
     int g_runtimeRefs = 0;
     bool g_juceInitialised = false;
@@ -157,6 +253,7 @@ namespace
             g_hostWindow = std::make_unique<HostWindow>();
         }
     }
+#endif
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
@@ -341,11 +438,14 @@ static int __cdecl DspModifySamples(winampDSPModule* thisMod,
     if (numChannels <= 0)
         return numSamples;
 
-    if (!IsRuntimeStarted())
+    if (thisMod->userData == nullptr)
         return numSamples;
 
     try
     {
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+        g_outProcClient.process(samples, numSamples, bps, numChannels, sampleRate);
+#else
         VST3HostEngine::getInstance().processAudio(
             samples, numSamples, bps, numChannels, sampleRate);
 
@@ -356,6 +456,7 @@ static int __cdecl DspModifySamples(winampDSPModule* thisMod,
                 thisMod->userData = nullptr;
             StopRuntime();
         }
+#endif
 
         return numSamples;
     }

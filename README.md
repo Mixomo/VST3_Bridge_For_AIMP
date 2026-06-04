@@ -2,6 +2,8 @@
 
 VST3 Bridge for AIMP is a Windows DSP plug-in that hosts a single VST3 effect inside AIMP's DSP pipeline. It is intended for users who want to run a selected VST3 processor while playing audio through AIMP, including ASIO output.
 
+VST3 plug-ins run in the separate `VST3BridgeHost.exe` process. A plug-in crash therefore terminates the helper instead of AIMP; the DSP bridge falls back to bypass and the helper can be restarted by reopening the bridge configuration.
+
 Developed by Ezequiel Casas (Mixomo): https://github.com/Mixomo
 
 ![dsp_plugin](assets/dsp.png)
@@ -18,6 +20,10 @@ The bridge currently prioritizes stability:
 
 - Manual VST3 selection only, no plug-in folder scanning.
 - One active VST3 at a time.
+- Out-of-process VST3 audio processing and GUI hosting.
+- Pipelined shared-memory audio IPC that never waits for the helper from AIMP's DSP callback.
+- The helper audio thread uses Windows MMCSS `Pro Audio` scheduling.
+- Automatic bypass if the helper crashes or stops responding.
 - Preserves AIMP-provided sample rate and PCM bit depth where possible.
 - Supports float/double internal VST3 processing through JUCE.
 - Saves the last working VST3 and its state.
@@ -52,11 +58,10 @@ From the repository root:
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release --target dsp_vst3_audio
 cmake --build build --config Release --target package_aimppack
 ```
 
-The `package_aimppack` target invokes `cmake/PackageAimpPack.ps1`, which stages the DLL and creates the `.aimppack` ZIP package with PowerShell `Compress-Archive`.
+The `package_aimppack` target builds both the lightweight AIMP DSP DLL and the out-of-process VST3 host, then invokes `cmake/PackageAimpPack.ps1` to create the `.aimppack` ZIP package with PowerShell `Compress-Archive`.
 
 The package will be regenerated at:
 
@@ -68,7 +73,10 @@ The DLL inside the package is laid out for AIMP as:
 
 ```text
 dsp_vst3_bridge/x64/dsp_vst3_bridge.dll
+dsp_vst3_bridge/x64/VST3BridgeHost.exe
 ```
+
+`dsp_vst3_bridge.dll` runs inside AIMP and only handles the DSP callback and IPC. `VST3BridgeHost.exe` owns JUCE, loads the selected VST3, processes audio through shared memory, and displays the VST3 editor. Audio IPC is asynchronous and adds one AIMP DSP block of latency so the AIMP/ASIO feeding thread never blocks waiting for another process. If the helper crashes or stops responding, AIMP continues in bypass.
 
 ## Notes for Users
 

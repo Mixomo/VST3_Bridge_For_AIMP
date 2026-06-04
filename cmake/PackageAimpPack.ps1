@@ -6,6 +6,9 @@ param(
     [string] $DllPath,
 
     [Parameter(Mandatory = $true)]
+    [string] $HostPath,
+
+    [Parameter(Mandatory = $true)]
     [string] $OutputFile
 )
 
@@ -21,6 +24,7 @@ New-Item -ItemType Directory -Force -Path $x64Dir | Out-Null
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 Copy-Item -LiteralPath $DllPath -Destination (Join-Path $x64Dir 'dsp_vst3_bridge.dll') -Force
+Copy-Item -LiteralPath $HostPath -Destination (Join-Path $x64Dir 'VST3BridgeHost.exe') -Force
 Remove-Item -LiteralPath $zipFile -Force -ErrorAction SilentlyContinue
 
 Compress-Archive -Path $pluginDir -DestinationPath $zipFile -CompressionLevel Optimal -Force
