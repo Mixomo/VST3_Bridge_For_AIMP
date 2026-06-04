@@ -22,8 +22,8 @@ The bridge currently prioritizes stability:
 - One active VST3 at a time.
 - Out-of-process VST3 audio processing and GUI hosting.
 - Pipelined shared-memory audio IPC that never waits for the helper from AIMP's DSP callback.
-- The helper audio thread uses Windows MMCSS `Pro Audio` scheduling.
-- Automatic bypass if the helper crashes or stops responding.
+- The helper runs at normal process priority without realtime scheduling, avoiding competition with AIMP's ASIO thread.
+- Automatic bypass if the helper crashes, stops responding, or is temporarily starved by the system.
 - Preserves AIMP-provided sample rate and PCM bit depth where possible.
 - Supports float/double internal VST3 processing through JUCE.
 - Saves the last working VST3 and its state.
@@ -76,7 +76,7 @@ dsp_vst3_bridge/x64/dsp_vst3_bridge.dll
 dsp_vst3_bridge/x64/VST3BridgeHost.exe
 ```
 
-`dsp_vst3_bridge.dll` runs inside AIMP and only handles the DSP callback and IPC. `VST3BridgeHost.exe` owns JUCE, loads the selected VST3, processes audio through shared memory, and displays the VST3 editor. Audio IPC is asynchronous and adds one AIMP DSP block of latency so the AIMP/ASIO feeding thread never blocks waiting for another process. If the helper crashes or stops responding, AIMP continues in bypass.
+`dsp_vst3_bridge.dll` runs inside AIMP and only handles the DSP callback and IPC. `VST3BridgeHost.exe` owns JUCE, loads the selected VST3, processes audio through shared memory, and displays the VST3 editor. Audio IPC is asynchronous and adds two AIMP DSP blocks of latency so the AIMP/ASIO feeding thread never blocks waiting for another process. If the helper crashes, stops responding, or is temporarily starved by the system, AIMP continues in dry bypass until processing recovers.
 
 ## Notes for Users
 
