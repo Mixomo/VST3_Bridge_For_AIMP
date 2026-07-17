@@ -297,7 +297,7 @@ struct VST3PluginWindow final : public AudioProcessorEditor,
 
     void paint (Graphics& g) override
     {
-        g.fillAll (Colours::black);
+        g.fillAll (Colour (0xff1e1e1e));
     }
 
     void mouseWheelMove (const MouseEvent&, const MouseWheelDetails& wheel) override
@@ -388,6 +388,8 @@ private:
             warnOnFailure (view->getSize (&rect));
 
             resizeWithRect (embeddedComponent, rect);
+            embeddedComponent.setTopLeftPosition (jmax (0, (getWidth() - embeddedComponent.getWidth()) / 2),
+                                                  jmax (0, (getHeight() - embeddedComponent.getHeight()) / 2));
         }
 
         // Some plugins don't update their cursor correctly when mousing out the window
@@ -546,13 +548,13 @@ private:
                 setHWND (peer->getNativeHandle());
         }
 
-        void paint (Graphics& g) override { g.fillAll (Colours::black); }
+        void paint (Graphics& g) override { g.fillAll (Colour (0xff1e1e1e)); }
 
     private:
         struct Inner final : public Component
         {
             Inner() { setOpaque (true); }
-            void paint (Graphics& g) override { g.fillAll (Colours::black); }
+            void paint (Graphics& g) override { g.fillAll (Colour (0xff1e1e1e)); }
         };
 
         Inner inner;

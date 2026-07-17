@@ -4,18 +4,18 @@
 #include <cstdint>
 
 constexpr std::uint32_t VST3_BRIDGE_IPC_MAGIC = 0x33425041; // APB3
-constexpr std::uint32_t VST3_BRIDGE_IPC_VERSION = 3;
+constexpr std::uint32_t VST3_BRIDGE_IPC_VERSION = 5;
 constexpr std::uint32_t VST3_BRIDGE_IPC_MAX_AUDIO_BYTES = 32 * 1024 * 1024;
 constexpr std::uint32_t VST3_BRIDGE_IPC_SLOT_COUNT = 4;
 constexpr std::uint64_t VST3_BRIDGE_IPC_PIPELINE_BLOCKS = 2;
 
-constexpr LONG VST3_BRIDGE_SLOT_EMPTY = 0;
-constexpr LONG VST3_BRIDGE_SLOT_REQUEST = 1;
-constexpr LONG VST3_BRIDGE_SLOT_RESPONSE = 2;
+constexpr long VST3_BRIDGE_SLOT_EMPTY = 0;
+constexpr long VST3_BRIDGE_SLOT_REQUEST = 1;
+constexpr long VST3_BRIDGE_SLOT_RESPONSE = 2;
 
 struct VST3BridgeIpcSlot
 {
-    volatile LONG state;
+    volatile long state;
     std::uint32_t status;
     std::uint32_t audioBytes;
     std::uint32_t numFrames;
@@ -31,8 +31,16 @@ struct VST3BridgeIpcHeader
     std::uint32_t version;
     std::uint32_t slotCount;
     std::uint32_t maxAudioBytes;
+    volatile long requestedArchitecture;
+    volatile long hostArchitecture;
+    volatile long showGuiSequence;
+    volatile long handledGuiSequence;
     VST3BridgeIpcSlot slots[VST3_BRIDGE_IPC_SLOT_COUNT];
 };
+
+static_assert(sizeof(VST3BridgeIpcSlot) == 40);
+static_assert(offsetof(VST3BridgeIpcSlot, sequence) == 32);
+static_assert(sizeof(VST3BridgeIpcHeader) == 192);
 
 inline unsigned char* vst3BridgeIpcAudio(VST3BridgeIpcHeader* header, std::uint32_t slotIndex)
 {

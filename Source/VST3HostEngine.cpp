@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "VST3HostEngine.h"
+#include "OutProcProtocol.h"
 #include <juce_core/juce_core.h>
 #include <cstdint>
 #include <cstdio>
@@ -197,23 +198,31 @@ VST3HostEngine::~VST3HostEngine()
     shutdown();
 }
 
-void VST3HostEngine::init(void* hInst)
+void VST3HostEngine::init(void* hInst, const bridge::RuntimePaths& paths, bool restorePlugin)
 {
     dllInstance = hInst;
-    writeLog("Host init");
+    runtimePaths = paths;
+    configStore = std::make_unique<bridge::ConfigStore>(runtimePaths);
+    writeLog("Host init; AIMP SDK " + juce::String(bridge::aimpSdkVersion)
+             + "; architecture=" + bridge::architectureName(bridge::currentArchitecture())
+             + "; packageRoot=" + runtimePaths.packageRoot.getFullPathName()
+             + "; config=" + runtimePaths.activeConfig.getFullPathName());
     
     // Register the VST3 format
     if (formatManager.getNumFormats() == 0)
-        formatManager.addFormat(new juce::VST3PluginFormat());
+        formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
     
-    // Restore cached plugin list and the last selected plugin. Scanning is
-    // manual from the config window; doing it on DSP enable can load arbitrary
-    // third-party modules while AIMP is toggling the effect.
-    loadState();
+    loadState(restorePlugin);
 }
 
 void VST3HostEngine::shutdown()
 {
+    cancelScan();
+    if (scanThread != nullptr)
+    {
+        scanThread->stopThread(2000);
+        scanThread.reset();
+    }
     writeLog("Host shutdown");
     writeLog("Realtime stats: lockMisses=" + juce::String(lockMissCount.load())
              + " smoothedBypassBlocks=" + juce::String(smoothedBypassCount.load())
@@ -222,43 +231,47 @@ void VST3HostEngine::shutdown()
              + " clippedOutputSamples=" + juce::String(clippedOutputSamples.load())
              + " nonFiniteOutputSamples=" + juce::String(nonFiniteOutputSamples.load())
              + " maxOutputAbs=" + juce::String(maxOutputMilliAbs.load() / 1000.0, 3));
-    saveState();
     unloadPlugin();
 }
 
 juce::Array<juce::PluginDescription> VST3HostEngine::getAvailablePlugins() const
 {
+    const juce::ScopedLock lock(stateLock);
     return pluginList.getTypes();
 }
 
-bool VST3HostEngine::loadPlugin(const juce::String& path)
+bool VST3HostEngine::loadPlugin(const juce::String& path, bool restoreSavedState)
 {
     // Ensure thread-safe plugin swapping
     const juce::ScopedLock sl(processLock);
     
     unloadPlugin();
-    writeLog("Loading plugin: " + path);
+    pendingPluginState.reset();
+    const auto bundle = bridge::vst3BundleRoot(juce::File(path));
+    const auto loadPath = bundle.getFullPathName();
+    writeLog("Loading plugin: " + loadPath);
 
-    if (isPluginIncompatible(path))
+    if (isPluginIncompatible(loadPath))
     {
-        writeLog("Plugin blocked and hidden from bridge list: " + path);
-        quarantineFailedPlugin(path);
+        writeLog("Plugin blocked and hidden from bridge list: " + loadPath);
         return false;
     }
-    
-    juce::PluginDescription desc;
-    desc.pluginFormatName = "VST3";
-    desc.fileOrIdentifier = path;
-    
-    // Find matching description in our list if available to populate manufacturer, etc.
-    for (const auto& d : pluginList.getTypes())
+
+    auto* format = formatManager.getFormat(0);
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    if (format != nullptr) format->findAllTypesForFile(descriptions, loadPath);
+    if (descriptions.isEmpty())
     {
-        if (d.fileOrIdentifier == path)
-        {
-            desc = d;
-            break;
-        }
+        markPluginLoadFailure(loadPath, "No compatible VST3 class was found");
+        return false;
     }
+    auto desc = *descriptions[0];
+    const auto canonical = bridge::canonicalPath(bundle);
+    const auto records = getPluginRecords();
+    for (const auto& record : records)
+        if (record.canonicalPath.equalsIgnoreCase(canonical))
+            for (const auto* candidate : descriptions)
+                if (candidate->createIdentifierString() == record.uid) desc = *candidate;
     
     juce::String errorMsg;
     double sampleRate = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
@@ -274,8 +287,18 @@ bool VST3HostEngine::loadPlugin(const juce::String& path)
         pluginInstance->setProcessingPrecision(useDoublePrecision ? juce::AudioProcessor::doublePrecision
                                                                   : juce::AudioProcessor::singlePrecision);
         pluginInstance->addListener(this);
-        activePluginPath = path;
+        activePluginPath = loadPath;
         rememberPluginDescription(desc);
+        if (restoreSavedState)
+        {
+            const juce::ScopedLock lock(stateLock);
+            for (const auto& record : settings.plugins)
+                if (record.canonicalPath.equalsIgnoreCase(canonical) && record.state.isNotEmpty())
+                {
+                    pendingPluginState.fromBase64Encoding(record.state);
+                    break;
+                }
+        }
         processLogCountdown = 8;
         lastLoggedLatency = -1;
 
@@ -287,6 +310,14 @@ bool VST3HostEngine::loadPlugin(const juce::String& path)
                  + " doublePrecision=" + juce::String(useDoublePrecision ? "yes" : "no")
                  + " hasEditor=" + juce::String(pluginInstance->hasEditor() ? "yes" : "no"));
         writeLog("Initial bus state:" + describeBuses(*pluginInstance));
+
+        if (preserveRecoveredState)
+        {
+            const auto preserved = settings.activePlugin.resolve(runtimePaths);
+            if (!preserved.getFullPathName().equalsIgnoreCase(loadPath)
+                || !pendingPluginState.fromBase64Encoding(settings.pluginState))
+                preserveRecoveredState = false;
+        }
         
         if (currentSampleRate > 0.0 && currentNumChannels > 0)
         {
@@ -296,8 +327,8 @@ bool VST3HostEngine::loadPlugin(const juce::String& path)
         return true;
     }
     
-    writeLog("Plugin load failed: " + path + " error=\"" + errorMsg + "\"");
-    quarantineFailedPlugin(path);
+    writeLog("Plugin load failed: " + loadPath + " error=\"" + errorMsg + "\"");
+    markPluginLoadFailure(loadPath, errorMsg);
     return false;
 }
 
@@ -342,6 +373,7 @@ void VST3HostEngine::rememberPluginDescription(const juce::PluginDescription& de
     if (desc.fileOrIdentifier.isEmpty())
         return;
 
+    const juce::ScopedLock lock(stateLock);
     for (const auto& existing : pluginList.getTypes())
     {
         if (existing.fileOrIdentifier == desc.fileOrIdentifier)
@@ -349,6 +381,29 @@ void VST3HostEngine::rememberPluginDescription(const juce::PluginDescription& de
     }
 
     pluginList.addType(desc);
+
+    const auto bundle = bridge::vst3BundleRoot(juce::File(desc.fileOrIdentifier));
+    const auto canonical = bridge::canonicalPath(bundle);
+    for (const auto& record : settings.plugins)
+        if (record.canonicalPath.equalsIgnoreCase(canonical)) return;
+    bridge::PluginRecord record;
+    record.location = bridge::PathReference::fromFile(bundle, runtimePaths);
+    record.canonicalPath = canonical;
+    record.name = desc.name;
+    record.descriptiveName = desc.descriptiveName;
+    record.manufacturer = desc.manufacturerName;
+    record.version = desc.version;
+    record.category = desc.category;
+    record.uid = desc.createIdentifierString();
+    record.architecture = bridge::detectBundleArchitecture(bundle);
+    record.fingerprint = bridge::fingerprintBundle(bundle);
+    record.instrument = desc.isInstrument;
+    record.numInputChannels = desc.numInputChannels;
+    record.numOutputChannels = desc.numOutputChannels;
+    record.sharedContainer = desc.hasSharedContainer;
+    record.araExtension = desc.hasARAExtension;
+    record.lastScanTime = juce::Time::getCurrentTime().toMilliseconds();
+    settings.plugins.add(record);
 }
 
 bool VST3HostEngine::isPluginIncompatible(const juce::String& path) const
@@ -370,8 +425,34 @@ bool VST3HostEngine::consumeBypassRequested()
 void VST3HostEngine::quarantineFailedPlugin(const juce::String& path)
 {
     writeLog("Quarantining failed plugin and entering bridge bypass: " + path);
-    removePluginFromList(path);
+    const auto canonical = bridge::canonicalPath(juce::File(path));
+    const juce::ScopedLock lock(stateLock);
+    for (auto& record : settings.plugins)
+    {
+        if (record.canonicalPath.equalsIgnoreCase(canonical))
+        {
+            record.runtimeQuarantined = true;
+            record.status = "Runtime failed";
+            record.lastError = "Plugin failed during runtime processing";
+            break;
+        }
+    }
+    pluginPrepared = false;
     bypassRequested = true;
+}
+
+void VST3HostEngine::markPluginLoadFailure(const juce::String& path, const juce::String& error)
+{
+    const auto canonical = bridge::canonicalPath(bridge::vst3BundleRoot(juce::File(path)));
+    const juce::ScopedLock lock(stateLock);
+    for (auto& record : settings.plugins)
+        if (record.canonicalPath.equalsIgnoreCase(canonical))
+        {
+            record.status = "Load failed";
+            record.lastError = error.isNotEmpty() ? error : "VST3 instance creation failed";
+            record.runtimeQuarantined = false;
+            break;
+        }
 }
 
 void VST3HostEngine::removePluginFromList(const juce::String& path)
@@ -398,12 +479,20 @@ void VST3HostEngine::removePluginFromList(const juce::String& path)
     if (found)
         pluginList.removeType(descToRemove);
 
+    const auto canonical = bridge::canonicalPath(juce::File(path));
+    {
+        const juce::ScopedLock lock(stateLock);
+        for (int i = settings.plugins.size(); --i >= 0;)
+            if (settings.plugins.getReference(i).canonicalPath.equalsIgnoreCase(canonical)) settings.plugins.remove(i);
+    }
+
     writeLog("Removed plugin from dropdown: " + path);
     saveState();
 }
 
 void VST3HostEngine::unloadPlugin()
 {
+    if (pluginInstance != nullptr) saveState();
     const juce::ScopedLock sl(processLock);
     if (pluginInstance != nullptr)
     {
@@ -753,18 +842,12 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
 
 juce::File VST3HostEngine::getConfigFile() const
 {
-    auto configDir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-        .getChildFile("Mixomo")
-        .getChildFile("VST3 Bridge");
-
-    configDir.createDirectory();
-    return configDir.getChildFile("dsp_vst3_bridge_config.json");
+    return runtimePaths.activeConfig;
 }
 
 juce::File VST3HostEngine::getLogFile() const
 {
-    return juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getChildFile("dsp_vst3_bridge.log");
+    return runtimePaths.logFile;
 }
 
 void VST3HostEngine::writeLog(const juce::String& message) const
@@ -777,126 +860,525 @@ void VST3HostEngine::writeLog(const juce::String& message) const
 
 void VST3HostEngine::saveState()
 {
-    juce::File configFile = getConfigFile();
-    
-    juce::DynamicObject::Ptr rootObj = new juce::DynamicObject();
-    
-    // Save active plugin path
-    rootObj->setProperty("activePluginPath", activePluginPath);
-    
-    // Save internal VST3 plugin state (as Base64)
+    if (configStore == nullptr)
+        return;
+
+    const juce::ScopedLock stateGuard(stateLock);
+    if (preserveRecoveredState)
+    {
+        juce::String error;
+        if (!configStore->save(settings, &error))
+            writeLog("Configuration save failed: " + error);
+        else
+            writeLog("Safe startup configuration saved without replacing the preserved plugin state");
+        return;
+    }
+    settings.activePlugin = activePluginPath.isEmpty() ? bridge::PathReference{}
+        : bridge::PathReference::fromFile(juce::File(activePluginPath), runtimePaths);
+    std::size_t savedStateBytes = 0;
     if (pluginInstance != nullptr)
     {
+        stateDirtyAt = 0;
         const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
         juce::MemoryBlock stateData;
         pluginInstance->getStateInformation(stateData);
-        rootObj->setProperty("pluginState", stateData.toBase64Encoding());
+        savedStateBytes = stateData.getSize();
+        settings.pluginState = stateData.toBase64Encoding();
+        const auto canonical = bridge::canonicalPath(juce::File(activePluginPath));
+        for (auto& record : settings.plugins)
+            if (record.canonicalPath.equalsIgnoreCase(canonical)) { record.state = settings.pluginState; break; }
     }
-    
-    // Save scanned plugin cache for faster loading
-    juce::Array<juce::var> pluginArray;
-    for (const auto& desc : pluginList.getTypes())
-    {
-        juce::DynamicObject::Ptr pObj = new juce::DynamicObject();
-        pObj->setProperty("name", desc.name);
-        pObj->setProperty("manufacturer", desc.manufacturerName);
-        pObj->setProperty("path", desc.fileOrIdentifier);
-        pObj->setProperty("uid", desc.uniqueId);
-        pObj->setProperty("version", desc.version);
-        pObj->setProperty("category", desc.category);
-        pObj->setProperty("descriptiveName", desc.descriptiveName);
-        pObj->setProperty("isInstrument", desc.isInstrument);
-        pluginArray.add(juce::var(pObj.get()));
-    }
-    rootObj->setProperty("scannedPlugins", pluginArray);
-
-    juce::var rootVar(rootObj.get());
-    juce::String jsonStr = juce::JSON::toString(rootVar);
-    configFile.replaceWithText(jsonStr);
+    juce::String error;
+    if (!configStore->save(settings, &error))
+        writeLog("Configuration save failed: " + error);
+    else
+        writeLog("Configuration saved; activePlugin=" + (activePluginPath.isNotEmpty() ? activePluginPath : "[Bypass]")
+                 + "; pluginStateBytes=" + juce::String(static_cast<juce::int64>(savedStateBytes)));
 }
 
-void VST3HostEngine::loadState()
+void VST3HostEngine::flushPendingStateSave()
 {
-    juce::File configFile = getConfigFile();
-    if (!configFile.existsAsFile())
-    {
-        auto legacyConfigFile = getLegacyConfigFile(dllInstance);
-        if (!legacyConfigFile.existsAsFile())
-            return;
+    auto changedAt = stateDirtyAt.load();
+    if (changedAt == 0 || juce::Time::getMillisecondCounter() - changedAt < 1000) return;
+    if (stateDirtyAt.compare_exchange_strong(changedAt, 0)) saveState();
+}
 
-        configFile = legacyConfigFile;
-    }
-        
-    auto rootVar = juce::JSON::parse(configFile);
-    auto* rootObj = rootVar.getDynamicObject();
-    if (rootObj == nullptr)
+void VST3HostEngine::loadState(bool restorePlugin)
+{
+    if (configStore == nullptr) return;
+    settings = configStore->load();
+    rebuildPluginListFromCache();
+
+    if (!restorePlugin)
+    {
+        preserveRecoveredState = true;
+        startupWarning = "The previous VST3 session failed its startup check. The bridge opened in bypass; your saved selection and state were preserved.";
+        writeLog("Safe startup enabled; previous plugin state preserved and bridge opened in bypass");
         return;
+    }
 
-    // Restore scanned plugin cache
-    if (rootObj->hasProperty("scannedPlugins"))
+    bridge::PathReference selected;
+    if (settings.startupMode != "none") selected = settings.activePlugin;
+    const auto path = selected.resolve(runtimePaths);
+    writeLog("Restoring startup state; mode=" + settings.startupMode
+             + "; selected=" + (selected.path.isNotEmpty() ? path.getFullPathName() : "[Bypass]")
+             + "; encodedStateChars=" + juce::String(settings.pluginState.length()));
+    if (!path.exists() || selected.path.isEmpty()) return;
+
+    const auto canonical = bridge::canonicalPath(path);
+    for (const auto& record : settings.plugins)
+        if (record.canonicalPath.equalsIgnoreCase(canonical)
+            && (record.runtimeQuarantined || record.scannerQuarantined || record.status != "Compatible"))
+            return;
+
+    if (loadPlugin(path.getFullPathName()) && pluginInstance != nullptr)
     {
-        auto* scannedArr = rootObj->getProperty("scannedPlugins").getArray();
-        if (scannedArr != nullptr)
+        if (pendingPluginState.isEmpty() && settings.pluginState.isNotEmpty())
+            pendingPluginState.fromBase64Encoding(settings.pluginState);
+        writeLog("Plugin state decoded; bytes="
+                 + juce::String(static_cast<juce::int64>(pendingPluginState.getSize())));
+        applyPendingPluginState();
+    }
+}
+
+void VST3HostEngine::applyPendingPluginState()
+{
+    if (pluginInstance == nullptr || pendingPluginState.isEmpty()) return;
+    pluginInstance->suspendProcessing(true);
+    {
+        const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
+        pluginInstance->setStateInformation(pendingPluginState.getData(), static_cast<int>(pendingPluginState.getSize()));
+    }
+    pluginInstance->suspendProcessing(false);
+    writeLog("Plugin state restored; bytes="
+             + juce::String(static_cast<juce::int64>(pendingPluginState.getSize())));
+    pendingPluginState.reset();
+    preserveRecoveredState = false;
+}
+
+VST3HostEngine::ScanThread::ScanThread(VST3HostEngine& ownerIn, juce::Array<juce::File> filesIn,
+                                       juce::Array<bridge::ScanFolder> foldersIn, bool forceIn, juce::File loadAfterScanIn)
+    : juce::Thread("VST3 bridge scanner"), owner(ownerIn), files(std::move(filesIn)),
+      folders(std::move(foldersIn)), force(forceIn), loadAfterScan(std::move(loadAfterScanIn))
+{
+}
+
+void VST3HostEngine::ScanThread::run()
+{
+    if (!folders.isEmpty()) files = bridge::discoverVst3Candidates(folders, owner.runtimePaths);
+    owner.runScan(files, force, loadAfterScan);
+}
+
+void VST3HostEngine::scanAll(bool force)
+{
+    if (isScanning()) return;
+    const auto snapshot = getSettingsSnapshot();
+    auto folders = snapshot.scanFolders;
+    if (!snapshot.scanBridgeFolder)
+    {
+        for (int i = folders.size(); --i >= 0;)
         {
-            for (auto& pVar : *scannedArr)
-            {
-                auto* pObj = pVar.getDynamicObject();
-                if (pObj != nullptr)
-                {
-                    juce::PluginDescription desc;
-                    desc.pluginFormatName = "VST3";
-                    desc.name = pObj->getProperty("name").toString();
-                    desc.manufacturerName = pObj->getProperty("manufacturer").toString();
-                    desc.fileOrIdentifier = pObj->getProperty("path").toString();
-                    desc.uniqueId = static_cast<int>(pObj->getProperty("uid"));
-                    desc.version = pObj->getProperty("version").toString();
-                    desc.category = pObj->getProperty("category").toString();
-                    desc.descriptiveName = pObj->getProperty("descriptiveName").toString();
-                    desc.isInstrument = static_cast<bool>(pObj->getProperty("isInstrument"));
-                    rememberPluginDescription(desc);
-                }
-            }
+            const auto resolved = folders.getReference(i).location.resolve(runtimePaths);
+            if (resolved == runtimePaths.packageRoot || resolved == runtimePaths.packageRoot.getChildFile("VST3"))
+                folders.remove(i);
         }
     }
-    
-    // Restore active plugin and its state
-    if (rootObj->hasProperty("activePluginPath"))
+    if (snapshot.scanSystemFolders)
     {
-        juce::String path = rootObj->getProperty("activePluginPath").toString();
-        if (isPluginIncompatible(path))
+        const auto programFiles = juce::File::getSpecialLocation(juce::File::globalApplicationsDirectory);
+        const auto programFilesX86 = juce::File(juce::SystemStats::getEnvironmentVariable("ProgramFiles(x86)", {}));
+        folders.add({ bridge::PathReference::fromFile(programFiles.getChildFile("Common Files").getChildFile("VST3"), runtimePaths), true, true });
+        if (programFilesX86 != juce::File())
+            folders.add({ bridge::PathReference::fromFile(programFilesX86.getChildFile("Common Files").getChildFile("VST3"), runtimePaths), true, true });
+    }
+    scanThread = std::make_unique<ScanThread>(*this, juce::Array<juce::File>(), std::move(folders), force, juce::File());
+    scanThread->startThread();
+}
+
+void VST3HostEngine::scanFolder(const bridge::ScanFolder& folder, bool force)
+{
+    if (isScanning()) return;
+    juce::Array<bridge::ScanFolder> folders { folder };
+    scanThread = std::make_unique<ScanThread>(*this, juce::Array<juce::File>(), std::move(folders), force, juce::File());
+    scanThread->startThread();
+}
+
+void VST3HostEngine::scanFileAndLoad(const juce::File& file)
+{
+    if (isScanning()) return;
+    juce::Array<juce::File> files { file };
+    scanThread = std::make_unique<ScanThread>(*this, std::move(files), juce::Array<bridge::ScanFolder>(), true, file);
+    scanThread->startThread();
+}
+
+void VST3HostEngine::cancelScan()
+{
+    if (scanThread != nullptr) scanThread->signalThreadShouldExit();
+}
+
+bool VST3HostEngine::isScanning() const
+{
+    return scanThread != nullptr && scanThread->isThreadRunning();
+}
+
+juce::String VST3HostEngine::getScanProgress() const
+{
+    const juce::ScopedLock lock(stateLock);
+    if (!isScanning()) return scanSummary;
+    return "Scanning " + juce::String(scanDone.load() + 1) + " of " + juce::String(scanTotal.load())
+        + " - " + scanCurrent + " - compatible " + juce::String(scanCompatible.load())
+        + ", failed " + juce::String(scanFailed.load()) + ", timed out " + juce::String(scanTimedOut.load());
+}
+
+bridge::BridgeSettings VST3HostEngine::getSettingsSnapshot() const
+{
+    const juce::ScopedLock lock(stateLock);
+    return settings;
+}
+
+bridge::RuntimePaths VST3HostEngine::getRuntimePaths() const
+{
+    return runtimePaths;
+}
+
+void VST3HostEngine::updateSettings(const bridge::BridgeSettings& newSettings)
+{
+    const bool storageChanged = newSettings.requestedStorageMode != settings.requestedStorageMode;
+    {
+        const juce::ScopedLock lock(stateLock);
+        settings = newSettings;
+    }
+    if (storageChanged && configStore != nullptr)
+    {
+        juce::String error;
+        if (configStore->changeStorageMode(settings.requestedStorageMode, settings, &error))
+            runtimePaths = configStore->getPaths();
+        else
+            writeLog("Storage mode change failed: " + error);
+    }
+    else
+        saveState();
+}
+
+juce::Array<bridge::PluginRecord> VST3HostEngine::getPluginRecords() const
+{
+    const juce::ScopedLock lock(stateLock);
+    return settings.plugins;
+}
+
+void VST3HostEngine::retryPlugin(const juce::String& path)
+{
+    const juce::File file(path);
+    {
+        const juce::ScopedLock lock(stateLock);
+        for (auto& record : settings.plugins)
+            if (record.canonicalPath.equalsIgnoreCase(bridge::canonicalPath(file)))
+            {
+                record.scannerQuarantined = false;
+                record.runtimeQuarantined = false;
+                record.lastError.clear();
+            }
+    }
+    scanFileAndLoad(file);
+}
+
+void VST3HostEngine::resetScanCache()
+{
+    {
+        const juce::ScopedLock lock(stateLock);
+        for (auto& plugin : settings.plugins)
         {
-            writeLog("Skipping restore of unsafe plugin: " + path);
-            quarantineFailedPlugin(path);
-            return;
+            plugin.fingerprint.clear();
+            plugin.lastError.clear();
+            plugin.scannerQuarantined = false;
+            plugin.runtimeQuarantined = false;
+            plugin.status = "Compatible";
+        }
+    }
+    rebuildPluginListFromCache();
+    saveState();
+}
+
+void VST3HostEngine::resetActivePluginParameters()
+{
+    const auto path = activePluginPath;
+    if (path.isEmpty() || !loadPlugin(path, false)) return;
+    saveState();
+    writeLog("Active plugin recreated with factory parameters: " + activePluginPath);
+}
+
+void VST3HostEngine::forgetAllPlugins()
+{
+    unloadPlugin();
+    {
+        const juce::ScopedLock lock(stateLock);
+        settings.plugins.clear();
+        settings.activePlugin = {};
+        settings.pluginState.clear();
+        pluginList.clear();
+    }
+    saveState();
+}
+
+juce::String VST3HostEngine::getDiagnostics() const
+{
+    const auto snapshot = getSettingsSnapshot();
+    int scannerQuarantine = 0, runtimeQuarantine = 0;
+    for (const auto& plugin : snapshot.plugins)
+    {
+        scannerQuarantine += plugin.scannerQuarantined ? 1 : 0;
+        runtimeQuarantine += plugin.runtimeQuarantined ? 1 : 0;
+    }
+    juce::String text;
+    text << "VST3 Bridge for AIMP\r\n"
+         << "Bridge version: " << bridge::bridgeVersion << " (config schema " << bridge::configSchemaVersion << ")\r\n"
+         << "AIMP SDK: " << bridge::aimpSdkVersion << "\r\n"
+         << "IPC version: " << VST3_BRIDGE_IPC_VERSION << "\r\n"
+         << "Helper architecture: " << bridge::architectureName(bridge::currentArchitecture()) << "\r\n"
+         << "Process DPI awareness: " << (AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) ? "PerMonitorV2" : "other") << "\r\n"
+         << "System DPI: " << GetDpiForSystem() << " (" << juce::roundToInt(GetDpiForSystem() * 100.0 / 96.0) << "%)\r\n"
+         << "Saved monitor: " << snapshot.monitorName << "; saved DPI: " << snapshot.savedDpi << "\r\n"
+         << "Logical bounds: " << snapshot.logicalWindowBounds[0] << "," << snapshot.logicalWindowBounds[1] << ","
+         << snapshot.logicalWindowBounds[2] << "x" << snapshot.logicalWindowBounds[3] << "\r\n"
+         << "Visualizer: " << (snapshot.visualizerMode ? "yes" : "no") << "; fullscreen: " << (snapshot.fullscreen ? "yes" : "no") << "\r\n"
+         << "Active plugin: " << (activePluginPath.isNotEmpty() ? activePluginPath : "[Bypass]") << "\r\n"
+         << "Configuration: " << runtimePaths.activeConfig.getFullPathName() << "\r\n"
+         << "Bridge root: " << runtimePaths.packageRoot.getFullPathName() << "\r\n"
+         << "Log: " << runtimePaths.logFile.getFullPathName() << "\r\n"
+         << "Cached plugins: " << snapshot.plugins.size() << "\r\n"
+         << "Scanner quarantine: " << scannerQuarantine << "; runtime quarantine: " << runtimeQuarantine << "\r\n";
+    for (const auto& folder : snapshot.scanFolders)
+        text << "Scan folder: " << folder.location.resolve(runtimePaths).getFullPathName() << "\r\n";
+    return text;
+}
+
+void VST3HostEngine::setHostArchitectureRequester(std::function<void(bridge::Architecture)> callback)
+{
+    hostArchitectureRequester = std::move(callback);
+}
+
+void VST3HostEngine::requestHostArchitecture(const bridge::PluginRecord& plugin)
+{
+    unloadPlugin();
+    {
+        const juce::ScopedLock lock(stateLock);
+        settings.activePlugin = plugin.location;
+        settings.pluginState = plugin.state;
+    }
+    juce::String error;
+    if (configStore != nullptr && !configStore->save(settings, &error))
+        writeLog("Architecture switch configuration save failed: " + error);
+    if (hostArchitectureRequester) hostArchitectureRequester(plugin.architecture);
+}
+
+void VST3HostEngine::runScan(const juce::Array<juce::File>& files, bool force, const juce::File& loadAfterScan)
+{
+    scanDone = 0; scanTotal = files.size(); scanCompatible = 0; scanFailed = 0; scanTimedOut = 0;
+    {
+        const juce::ScopedLock lock(stateLock);
+        scanSummary.clear();
+        scanIssues.clear();
+    }
+    bool loadSucceeded = false;
+    for (const auto& file : files)
+    {
+        if (scanThread->threadShouldExit()) break;
+        const auto bundle = bridge::vst3BundleRoot(file);
+        const auto canonical = bridge::canonicalPath(bundle);
+        const auto fingerprint = bridge::fingerprintBundle(bundle);
+        bool cached = false;
+        {
+            const juce::ScopedLock lock(stateLock);
+            scanCurrent = file.getFileName();
+            for (const auto& record : settings.plugins)
+                if (record.canonicalPath.equalsIgnoreCase(canonical) && record.fingerprint == fingerprint
+                    && record.status == "Compatible" && !force)
+                {
+                    cached = true;
+                    ++scanCompatible;
+                    break;
+                }
         }
 
-        if (path.isNotEmpty() && loadPlugin(path))
+        bool compatible = cached;
+        if (!cached)
         {
-            if (rootObj->hasProperty("pluginState") && pluginInstance != nullptr)
+            auto result = scanOne(bundle);
             {
-                juce::String stateBase64 = rootObj->getProperty("pluginState").toString();
-                juce::MemoryBlock stateData;
-                if (stateData.fromBase64Encoding(stateBase64))
+                const juce::ScopedLock lock(stateLock);
+                int index = -1;
+                for (int i = 0; i < settings.plugins.size(); ++i)
+                    if (settings.plugins.getReference(i).canonicalPath.equalsIgnoreCase(canonical)) { index = i; break; }
+                if (index >= 0)
                 {
-                    pluginInstance->suspendProcessing(true);
-                    const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
-                    pluginInstance->setStateInformation(stateData.getData(), (int)stateData.getSize());
-                    pluginInstance->suspendProcessing(false);
+                    result.state = settings.plugins.getReference(index).state;
+                    settings.plugins.set(index, result);
                 }
+                else settings.plugins.add(result);
+                compatible = result.status == "Compatible";
+                if (compatible) ++scanCompatible;
+                else if (result.status == "Timed out") ++scanTimedOut;
+                else ++scanFailed;
+                if (!compatible)
+                    scanIssues.add(file.getFileName() + ": " + result.status
+                        + (result.lastError.isNotEmpty() ? " (" + result.lastError + ")" : juce::String()));
             }
+            if (!compatible)
+                writeLog("Scanner skipped " + file.getFullPathName() + ": " + result.status + " - " + result.lastError);
         }
+        ++scanDone;
+        loadSucceeded |= compatible && loadAfterScan != juce::File()
+            && canonical.equalsIgnoreCase(bridge::canonicalPath(bridge::vst3BundleRoot(loadAfterScan)));
+    }
+
+    {
+        const juce::ScopedLock lock(stateLock);
+        const bool cancelled = scanThread->threadShouldExit();
+        scanSummary = (cancelled ? "Scan cancelled: " : "Scan complete: ")
+            + juce::String(scanDone.load()) + " of " + juce::String(scanTotal.load())
+            + ", compatible " + juce::String(scanCompatible.load())
+            + ", failed " + juce::String(scanFailed.load())
+            + ", timed out " + juce::String(scanTimedOut.load());
+        if (!scanIssues.isEmpty()) scanSummary += " | skipped: " + scanIssues.joinIntoString("; ");
+    }
+    writeLog(scanSummary);
+
+    rebuildPluginListFromCache();
+    saveState();
+    if (loadSucceeded && !scanThread->threadShouldExit())
+    {
+        const auto path = loadAfterScan.getFullPathName();
+        juce::MessageManager::callAsync([path]
+        {
+            if (s_instance != nullptr && s_instance->loadPlugin(path)) s_instance->saveState();
+        });
+    }
+}
+
+bridge::PluginRecord VST3HostEngine::scanOne(const juce::File& file)
+{
+    const auto bundle = bridge::vst3BundleRoot(file);
+    bridge::PluginRecord record;
+    record.location = bridge::PathReference::fromFile(bundle, runtimePaths);
+    record.canonicalPath = bridge::canonicalPath(bundle);
+    record.architecture = bridge::detectBundleArchitecture(bundle);
+    record.fingerprint = bridge::fingerprintBundle(bundle);
+    record.lastScanTime = juce::Time::getCurrentTime().toMilliseconds();
+
+    auto scannerArchitecture = record.architecture;
+    if (scannerArchitecture == bridge::Architecture::unknown || scannerArchitecture == bridge::Architecture::multi)
+        scannerArchitecture = bridge::currentArchitecture();
+    const auto scanner = runtimePaths.scanner(scannerArchitecture);
+    if (!scanner.existsAsFile())
+    {
+        record.status = "Wrong architecture";
+        record.lastError = "Required scanner is missing: " + scanner.getFullPathName();
+        return record;
+    }
+
+    const auto resultFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+        .getNonexistentChildFile("vst3_scan_" + juce::Uuid().toString(), ".json", false);
+    juce::StringArray arguments { scanner.getFullPathName(), "--plugin", bundle.getFullPathName(),
+                                  "--result", resultFile.getFullPathName() };
+    juce::ChildProcess child;
+    if (!child.start(arguments, 0))
+    {
+        record.status = "Scan failed";
+        record.lastError = "Scanner process could not start";
+        return record;
+    }
+
+    const auto timeoutSeconds = getSettingsSnapshot().scanTimeoutSeconds;
+    const auto timeoutMs = juce::jlimit(1000, 120000, timeoutSeconds * 1000);
+    int elapsed = 0;
+    while (child.isRunning() && elapsed < timeoutMs && !scanThread->threadShouldExit())
+    {
+        child.waitForProcessToFinish(100);
+        elapsed += 100;
+    }
+    if (child.isRunning())
+    {
+        child.kill();
+        child.waitForProcessToFinish(2000);
+        record.status = scanThread->threadShouldExit() ? "Disabled" : "Timed out";
+        record.lastError = scanThread->threadShouldExit() ? "Scan cancelled"
+            : "Scanner exceeded " + juce::String(timeoutSeconds) + " seconds and was skipped";
+        record.scannerQuarantined = !scanThread->threadShouldExit();
+        resultFile.deleteFile();
+        return record;
+    }
+
+    const auto value = juce::JSON::parse(resultFile);
+    resultFile.deleteFile();
+    auto* object = value.getDynamicObject();
+    if (object == nullptr)
+    {
+        record.status = "Scan failed";
+        record.lastError = "Malformed scanner result";
+        record.scannerQuarantined = true;
+        return record;
+    }
+    const auto success = static_cast<bool>(object->getProperty("success"));
+    record.name = object->getProperty("name").toString();
+    record.descriptiveName = object->getProperty("descriptiveName").toString();
+    record.manufacturer = object->getProperty("manufacturer").toString();
+    record.version = object->getProperty("version").toString();
+    record.category = object->getProperty("category").toString();
+    record.uid = object->getProperty("uid").toString();
+    record.instrument = static_cast<bool>(object->getProperty("instrument"));
+    record.numInputChannels = static_cast<int>(object->getProperty("numInputChannels"));
+    record.numOutputChannels = static_cast<int>(object->getProperty("numOutputChannels"));
+    record.sharedContainer = static_cast<bool>(object->getProperty("sharedContainer"));
+    record.araExtension = static_cast<bool>(object->getProperty("araExtension"));
+    record.architecture = bridge::parseArchitecture(object->getProperty("architecture").toString());
+    record.lastError = object->getProperty("message").toString();
+    const auto scannerStatus = object->getProperty("status").toString();
+    record.status = success ? "Compatible" : (scannerStatus == "wrong architecture" ? "Wrong architecture" : "Scan failed");
+    record.scannerQuarantined = !success;
+    return record;
+}
+
+void VST3HostEngine::rebuildPluginListFromCache()
+{
+    const juce::ScopedLock lock(stateLock);
+    pluginList.clear();
+    for (auto& record : settings.plugins)
+    {
+        const auto file = record.location.resolve(runtimePaths);
+        if (!file.exists())
+        {
+            record.status = "Missing";
+            if (settings.removeMissing) continue;
+        }
+        if (record.status != "Compatible" || record.scannerQuarantined || record.runtimeQuarantined) continue;
+        juce::PluginDescription description;
+        description.pluginFormatName = "VST3";
+        description.name = record.name;
+        description.descriptiveName = record.descriptiveName.isNotEmpty() ? record.descriptiveName : record.name;
+        description.manufacturerName = record.manufacturer;
+        description.version = record.version;
+        description.category = record.category;
+        description.fileOrIdentifier = file.getFullPathName();
+        description.uniqueId = record.uid.hashCode();
+        description.isInstrument = record.instrument;
+        description.numInputChannels = record.numInputChannels;
+        description.numOutputChannels = record.numOutputChannels;
+        description.hasSharedContainer = record.sharedContainer;
+        description.hasARAExtension = record.araExtension;
+        pluginList.addType(description);
     }
 }
 
 void VST3HostEngine::audioProcessorParameterChanged(juce::AudioProcessor*, int, float)
 {
-    // Never perform file I/O from a processor callback. State is persisted
-    // when the selected plugin changes or the host shuts down.
+    stateDirtyAt = juce::Time::getMillisecondCounter();
 }
 
-void VST3HostEngine::audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails&)
+void VST3HostEngine::audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details)
 {
-    // See audioProcessorParameterChanged().
+    stateDirtyAt = juce::Time::getMillisecondCounter();
+    if (details.programChanged || details.nonParameterStateChanged)
+        ++editorStateRevision;
 }
 
 juce::Optional<juce::AudioPlayHead::PositionInfo> VST3HostEngine::SyntheticPlayHead::getPosition() const

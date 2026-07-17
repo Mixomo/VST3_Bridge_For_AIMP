@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
-project(AIMP_VST3_Bridge VERSION 1.0.0 LANGUAGES CXX C RC)
+project(AIMP_VST3_Bridge VERSION 2.0.0 LANGUAGES CXX C RC)
+
+message(STATUS "Building against AIMP SDK v5.40 build 2650")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 
 # Statically link MSVC runtime to prevent dependency issues on user machine
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -56,21 +59,12 @@ function(configure_juce_target target enable_aimp_plugin enable_winamp_dsp)
     )
 endfunction()
 
-# Native AIMP add-on: provides the plugin list entry and wrench config.
-add_library(dsp_vst3 SHARED
-    Source/dsp_vst3_main.cpp
-    Source/VST3HostEngine.cpp
-    Source/HostWindow.cpp
-    Source/dsp_vst3.rc
-)
-set_target_properties(dsp_vst3 PROPERTIES PREFIX "" SUFFIX ".dll")
-configure_juce_target(dsp_vst3 1 0)
-
 # Winamp-compatible DSP module: this is the audio processor AIMP should list
 # in the "Plugins DSP" selector.
 add_library(dsp_vst3_audio SHARED
     Source/dsp_vst3_main.cpp
     Source/OutProcClient.cpp
+    Source/BridgeRuntime.cpp
     Source/dsp_vst3.rc
 )
 set_target_properties(dsp_vst3_audio PROPERTIES PREFIX "" SUFFIX ".dll" OUTPUT_NAME "dsp_vst3_bridge")
@@ -80,26 +74,37 @@ target_compile_definitions(dsp_vst3_audio PRIVATE
     AIMP_VST3_BRIDGE_OUT_OF_PROCESS=1
 )
 target_include_directories(dsp_vst3_audio PRIVATE Source)
+target_link_libraries(dsp_vst3_audio PRIVATE juce::juce_core)
 
 add_executable(VST3BridgeHost WIN32
     Source/OutProcHostMain.cpp
     Source/VST3HostEngine.cpp
     Source/HostWindow.cpp
+    Source/BridgeRuntime.cpp
+    Source/VST3Bridge.manifest
 )
 configure_juce_target(VST3BridgeHost 0 0)
 
-set(AIMPPACK_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/aimppack_stage")
-set(AIMPPACK_FILE "${CMAKE_CURRENT_SOURCE_DIR}/dist/dsp_vst3_bridge.aimppack")
-
-add_custom_target(package_aimppack
-    COMMAND powershell
-            -NoProfile
-            -ExecutionPolicy Bypass
-            -File "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageAimpPack.ps1"
-            -StageDir "${AIMPPACK_STAGE_DIR}"
-            -DllPath "$<TARGET_FILE:dsp_vst3_audio>"
-            -HostPath "$<TARGET_FILE:VST3BridgeHost>"
-            -OutputFile "${AIMPPACK_FILE}"
-    DEPENDS dsp_vst3_audio VST3BridgeHost
-    COMMENT "Packaging ${AIMPPACK_FILE}"
+add_executable(VST3BridgeScanner WIN32
+    Source/ScannerMain.cpp
+    Source/BridgeRuntime.cpp
+    Source/VST3Bridge.manifest
 )
+configure_juce_target(VST3BridgeScanner 0 0)
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(BRIDGE_ARCH_SUFFIX 64)
+else()
+    set(BRIDGE_ARCH_SUFFIX 32)
+endif()
+set_target_properties(VST3BridgeHost PROPERTIES OUTPUT_NAME "VST3BridgeHost${BRIDGE_ARCH_SUFFIX}")
+set_target_properties(VST3BridgeScanner PROPERTIES OUTPUT_NAME "VST3BridgeScanner${BRIDGE_ARCH_SUFFIX}")
+
+enable_testing()
+add_executable(BridgeRuntimeTests
+    Source/BridgeRuntimeTests.cpp
+    Source/BridgeRuntime.cpp
+)
+target_include_directories(BridgeRuntimeTests PRIVATE Source)
+target_link_libraries(BridgeRuntimeTests PRIVATE juce::juce_core)
+add_test(NAME BridgeRuntimeTests COMMAND BridgeRuntimeTests)

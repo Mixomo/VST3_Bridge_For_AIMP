@@ -16,7 +16,8 @@ public:
     bool start(HMODULE bridgeModule);
     void stop();
     bool process(void* samples, int numFrames, int bitsPerSample, int numChannels, int sampleRate);
-    void showEditor();
+    bool showEditor();
+    void notifyDspStarted();
     bool isRunning() const;
     std::uint64_t getSubmittedBlocks() const { return submittedBlocks.load(); }
     std::uint64_t getCompletedBlocks() const { return completedBlocks.load(); }
@@ -29,17 +30,26 @@ public:
     std::uint64_t getEmergencyBypassBlocks() const { return emergencyBypassBlocks.load(); }
 
 private:
+    static DWORD WINAPI controlThreadEntry(void* context);
+    void controlLoop();
+    bool launchHost(int architecture, bool safeStart = false);
+    void stopHost();
     void closeHandles();
-    std::wstring getHostPath(HMODULE bridgeModule) const;
+    std::wstring getHostPath(HMODULE bridgeModule, int architecture) const;
     bool hostIsAlive() const;
 
     HANDLE mapping = nullptr;
     HANDLE requestEvent = nullptr;
     HANDLE shutdownEvent = nullptr;
     HANDLE showEvent = nullptr;
+    HANDLE dspStartEvent = nullptr;
+    HANDLE controlEvent = nullptr;
+    HANDLE controlThread = nullptr;
     HANDLE processHandle = nullptr;
     HANDLE jobHandle = nullptr;
     VST3BridgeIpcHeader* header = nullptr;
+    HMODULE module = nullptr;
+    std::atomic_bool stopping { false };
     std::uint64_t requestSequence = 0;
     std::int64_t qpcFrequency = 0;
     std::vector<unsigned char> inputStaging;

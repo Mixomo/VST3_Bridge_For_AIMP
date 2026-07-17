@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "OutProcClient.h"
+#include "BridgeRuntime.h"
 
 #include <algorithm>
 #include <cstring>
@@ -18,6 +19,53 @@ namespace
     std::wstring quote(const std::wstring& value)
     {
         return L"\"" + value + L"\"";
+    }
+
+    int initialHostArchitecture(const bridge::RuntimePaths& paths)
+    {
+        bridge::ConfigStore store(paths);
+        const auto settings = store.load();
+        if (settings.startupMode == "none") return static_cast<int>(bridge::currentArchitecture());
+        const auto selected = settings.activePlugin;
+        const auto canonical = bridge::canonicalPath(selected.resolve(paths));
+        for (const auto& plugin : settings.plugins)
+            if (plugin.canonicalPath.equalsIgnoreCase(canonical)
+                && (plugin.architecture == bridge::Architecture::x86 || plugin.architecture == bridge::Architecture::x64))
+                return static_cast<int>(plugin.architecture);
+        return static_cast<int>(bridge::currentArchitecture());
+    }
+
+    bool startupNeedsSmokeTest(const bridge::RuntimePaths& paths)
+    {
+        const auto settings = bridge::ConfigStore(paths).load();
+        if (settings.startupMode == "none") return false;
+        const auto selected = settings.activePlugin;
+        return selected.path.isNotEmpty() && selected.resolve(paths).exists();
+    }
+
+    bool runStartupSmokeTest(const std::wstring& hostPath, const bridge::RuntimePaths& paths)
+    {
+        std::wstringstream command;
+        command << quote(hostPath) << L" --smoke-test-startup"
+                << L" --bridge-root " << quote(std::wstring(paths.packageRoot.getFullPathName().toWideCharPointer()))
+                << L" --profile " << quote(std::wstring(paths.aimpProfile.getFullPathName().toWideCharPointer()));
+        auto commandLine = command.str();
+        STARTUPINFOW startup { sizeof(STARTUPINFOW) };
+        PROCESS_INFORMATION process {};
+        if (!CreateProcessW(hostPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup, &process))
+            return false;
+        CloseHandle(process.hThread);
+        const auto wait = WaitForSingleObject(process.hProcess, 5000);
+        if (wait != WAIT_OBJECT_0)
+        {
+            TerminateProcess(process.hProcess, 8);
+            WaitForSingleObject(process.hProcess, 1000);
+        }
+        DWORD exitCode = 8;
+        GetExitCodeProcess(process.hProcess, &exitCode);
+        CloseHandle(process.hProcess);
+        return wait == WAIT_OBJECT_0 && exitCode == 0;
     }
 }
 
@@ -44,8 +92,11 @@ bool OutProcClient::start(HMODULE bridgeModule)
     requestEvent = createInheritableEvent(false);
     shutdownEvent = createInheritableEvent(true);
     showEvent = createInheritableEvent(false);
+    dspStartEvent = createInheritableEvent(false);
+    controlEvent = createInheritableEvent(false);
 
-    if (mapping == nullptr || requestEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr)
+    if (mapping == nullptr || requestEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr
+        || dspStartEvent == nullptr || controlEvent == nullptr)
     {
         closeHandles();
         return false;
@@ -68,13 +119,42 @@ bool OutProcClient::start(HMODULE bridgeModule)
     QueryPerformanceFrequency(&frequency);
     qpcFrequency = frequency.QuadPart;
 
-    const auto hostPath = getHostPath(bridgeModule);
+    wchar_t modulePath[32768] {};
+    GetModuleFileNameW(bridgeModule, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    const auto moduleFile = juce::File::createFileWithoutCheckingPath(juce::String(modulePath));
+    const auto paths = bridge::RuntimePaths::detect(moduleFile);
+    module = bridgeModule;
+    stopping = false;
+    const auto architecture = initialHostArchitecture(paths);
+    const auto hostPath = getHostPath(module, architecture);
+    const bool safeStart = startupNeedsSmokeTest(paths) && !runStartupSmokeTest(hostPath, paths);
+    if (!launchHost(architecture, safeStart))
+    {
+        closeHandles();
+        return false;
+    }
+    controlThread = CreateThread(nullptr, 0, controlThreadEntry, this, 0, nullptr);
+    return controlThread != nullptr;
+}
+
+bool OutProcClient::launchHost(int architecture, bool safeStart)
+{
+    const auto hostPath = getHostPath(module, architecture);
+    if (hostPath.empty() || !juce::File(juce::String(hostPath.c_str())).existsAsFile()) return false;
+    wchar_t modulePath[32768] {};
+    GetModuleFileNameW(module, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    const auto paths = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath)));
     std::wstringstream command;
     command << quote(hostPath)
             << L" --mapping " << reinterpret_cast<std::uintptr_t>(mapping)
             << L" --request " << reinterpret_cast<std::uintptr_t>(requestEvent)
             << L" --shutdown " << reinterpret_cast<std::uintptr_t>(shutdownEvent)
-            << L" --show " << reinterpret_cast<std::uintptr_t>(showEvent);
+            << L" --show " << reinterpret_cast<std::uintptr_t>(showEvent)
+            << L" --dsp-start " << reinterpret_cast<std::uintptr_t>(dspStartEvent)
+            << L" --control " << reinterpret_cast<std::uintptr_t>(controlEvent);
+    if (safeStart) command << L" --safe-start";
+    command << L" --bridge-root " << quote(std::wstring(paths.packageRoot.getFullPathName().toWideCharPointer()))
+            << L" --profile " << quote(std::wstring(paths.aimpProfile.getFullPathName().toWideCharPointer()));
 
     auto commandLine = command.str();
     STARTUPINFOW startup { sizeof(STARTUPINFOW) };
@@ -104,18 +184,46 @@ bool OutProcClient::start(HMODULE bridgeModule)
         }
     }
 
+    header->hostArchitecture = architecture;
     return true;
 }
 
 void OutProcClient::stop()
 {
-    if (shutdownEvent != nullptr)
-        SetEvent(shutdownEvent);
-
-    if (processHandle != nullptr)
-        WaitForSingleObject(processHandle, 1500);
-
+    stopping = true;
+    if (controlEvent != nullptr) SetEvent(controlEvent);
+    stopHost();
+    if (controlThread != nullptr) { WaitForSingleObject(controlThread, 1500); CloseHandle(controlThread); controlThread = nullptr; }
     closeHandles();
+}
+
+void OutProcClient::stopHost()
+{
+    if (shutdownEvent != nullptr) SetEvent(shutdownEvent);
+    if (processHandle != nullptr) { WaitForSingleObject(processHandle, 1500); CloseHandle(processHandle); processHandle = nullptr; }
+    if (jobHandle != nullptr) { CloseHandle(jobHandle); jobHandle = nullptr; }
+}
+
+DWORD WINAPI OutProcClient::controlThreadEntry(void* context)
+{
+    static_cast<OutProcClient*>(context)->controlLoop();
+    return 0;
+}
+
+void OutProcClient::controlLoop()
+{
+    while (!stopping)
+    {
+        if (WaitForSingleObject(controlEvent, INFINITE) != WAIT_OBJECT_0 || stopping) break;
+        const auto requested = InterlockedExchange(&header->requestedArchitecture, 0);
+        if (requested != static_cast<long>(bridge::Architecture::x86)
+            && requested != static_cast<long>(bridge::Architecture::x64)) continue;
+        stopHost();
+        ResetEvent(shutdownEvent);
+        for (auto& slot : header->slots) InterlockedExchange(&slot.state, VST3_BRIDGE_SLOT_EMPTY);
+        requestSequence = 0;
+        launchHost(static_cast<int>(requested));
+    }
 }
 
 bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int numChannels, int sampleRate)
@@ -230,10 +338,17 @@ bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int
     return copiedResponse;
 }
 
-void OutProcClient::showEditor()
+bool OutProcClient::showEditor()
 {
-    if (hostIsAlive() && showEvent != nullptr)
-        SetEvent(showEvent);
+    if (!hostIsAlive() || showEvent == nullptr || header == nullptr) return false;
+    InterlockedIncrement(&header->showGuiSequence);
+    return SetEvent(showEvent) != FALSE;
+}
+
+void OutProcClient::notifyDspStarted()
+{
+    if (hostIsAlive() && dspStartEvent != nullptr)
+        SetEvent(dspStartEvent);
 }
 
 bool OutProcClient::isRunning() const
@@ -248,7 +363,7 @@ void OutProcClient::closeHandles()
     header = nullptr;
     inputStaging.clear();
 
-    for (auto* handle : { &mapping, &requestEvent, &shutdownEvent, &showEvent, &processHandle, &jobHandle })
+    for (auto* handle : { &mapping, &requestEvent, &shutdownEvent, &showEvent, &dspStartEvent, &controlEvent, &processHandle, &jobHandle })
     {
         if (*handle != nullptr)
             CloseHandle(*handle);
@@ -256,14 +371,12 @@ void OutProcClient::closeHandles()
     }
 }
 
-std::wstring OutProcClient::getHostPath(HMODULE bridgeModule) const
+std::wstring OutProcClient::getHostPath(HMODULE bridgeModule, int architecture) const
 {
     wchar_t modulePath[MAX_PATH] {};
     GetModuleFileNameW(bridgeModule, modulePath, MAX_PATH);
-    std::wstring path(modulePath);
-    const auto slash = path.find_last_of(L"\\/");
-    return (slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1))
-         + L"VST3BridgeHost.exe";
+    const auto paths = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath)));
+    return std::wstring(paths.helper(static_cast<bridge::Architecture>(architecture)).getFullPathName().toWideCharPointer());
 }
 
 bool OutProcClient::hostIsAlive() const

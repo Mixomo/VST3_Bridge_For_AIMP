@@ -2,6 +2,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdio>
+#include "BridgeRuntime.h"
 
 #ifndef AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN
 #define AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN 1
@@ -45,16 +46,11 @@ namespace
 
     void WriteDebugLog(const char* message)
     {
-        char tempPath[MAX_PATH] = {};
-        if (GetTempPathA(MAX_PATH, tempPath) == 0)
-            return;
-
-        char logPath[MAX_PATH] = {};
-        if (sprintf_s(logPath, "%sdsp_vst3_bridge.log", tempPath) <= 0)
-            return;
-
+        wchar_t modulePath[32768] {};
+        GetModuleFileNameW(g_hInst, modulePath, static_cast<DWORD>(std::size(modulePath)));
+        const auto logPath = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath))).logFile;
         FILE* file = nullptr;
-        if (fopen_s(&file, logPath, "ab") != 0 || file == nullptr)
+        if (_wfopen_s(&file, logPath.getFullPathName().toWideCharPointer(), L"ab") != 0 || file == nullptr)
             return;
 
         SYSTEMTIME st = {};
@@ -68,10 +64,7 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_runtimeMutex);
         if (g_runtimeRefs > 0 && g_outProcClient.isRunning())
-        {
-            ++g_runtimeRefs;
             return true;
-        }
 
         if (g_runtimeRefs > 0)
             g_outProcClient.stop();
@@ -93,8 +86,7 @@ namespace
         std::lock_guard<std::mutex> lock(g_runtimeMutex);
         if (g_runtimeRefs <= 0)
             return;
-        if (--g_runtimeRefs > 0)
-            return;
+        g_runtimeRefs = 0;
         char stats[512] = {};
         sprintf_s(stats,
                   "Out-of-process pipeline stats: submitted=%llu completed=%llu missed=%llu stale=%llu queueFull=%llu emergencyBypass=%llu clientMaxMicros=%llu clientOver1ms=%llu clientOver3ms=%llu",
@@ -122,7 +114,7 @@ namespace
     {
         if (!IsRuntimeStarted() && !StartRuntime())
             return;
-        g_outProcClient.showEditor();
+        WriteDebugLog(g_outProcClient.showEditor() ? "Show GUI request queued" : "Show GUI request failed");
     }
 
 #else
@@ -133,19 +125,14 @@ namespace
 
     void WriteDebugLog(const char* message)
     {
-        char tempPath[MAX_PATH] = {};
-        if (GetTempPathA(MAX_PATH, tempPath) == 0)
-            return;
-
-        char logPath[MAX_PATH] = {};
-        if (sprintf_s(logPath, "%sdsp_vst3_bridge.log", tempPath) <= 0)
-            return;
-
+        wchar_t modulePath[32768] {};
+        GetModuleFileNameW(g_hInst, modulePath, static_cast<DWORD>(std::size(modulePath)));
+        const auto logPath = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath))).logFile;
         SYSTEMTIME st = {};
         GetLocalTime(&st);
 
         FILE* file = nullptr;
-        if (fopen_s(&file, logPath, "ab") != 0 || file == nullptr)
+        if (_wfopen_s(&file, logPath.getFullPathName().toWideCharPointer(), L"ab") != 0 || file == nullptr)
             return;
 
         std::fprintf(file, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
@@ -420,6 +407,10 @@ static int __cdecl DspInit(winampDSPModule* thisMod)
 
     if (!StartRuntime())
         return 1;
+
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+    g_outProcClient.notifyDspStarted();
+#endif
 
     thisMod->userData = reinterpret_cast<void*>(1);
     return 0;
