@@ -4,6 +4,8 @@ VST3 Bridge for AIMP hosts a VST3 effect in AIMP's DSP pipeline, including ASIO 
 
 ![AIMP VST3 Bridge](assets/dsp2.png)
 
+### **NEW: If you're looking for a more advanced VST3 effects rack option, check out [VST3 Bridge Rack For AIMP](https://github.com/Mixomo/VST3_Bridge_For_AIMP/tree/vst3-rack)**
+
 ## Features
 
 - AIMP SDK v5.40 build 2650 integration.
