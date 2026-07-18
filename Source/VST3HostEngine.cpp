@@ -3,6 +3,7 @@
 #include "VST3HostEngine.h"
 #include "OutProcProtocol.h"
 #include <juce_core/juce_core.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -85,19 +86,6 @@ namespace
         {
             return false;
         }
-    }
-
-    juce::File getLegacyConfigFile(void* dllInstance)
-    {
-        if (dllInstance != nullptr)
-        {
-            char dllPath[MAX_PATH] {};
-            GetModuleFileNameA((HMODULE)dllInstance, dllPath, MAX_PATH);
-            return juce::File(dllPath).getParentDirectory().getChildFile("dsp_vst3_config.json");
-        }
-
-        return juce::File::getSpecialLocation(juce::File::currentExecutableFile)
-            .getParentDirectory().getChildFile("dsp_vst3_config.json");
     }
 
     double readInterleavedSample(const void* samples, const unsigned char* bytes, int bps, int sampleIndex)
@@ -242,10 +230,12 @@ juce::Array<juce::PluginDescription> VST3HostEngine::getAvailablePlugins() const
 
 bool VST3HostEngine::loadPlugin(const juce::String& path, bool restoreSavedState)
 {
-    // Ensure thread-safe plugin swapping
     const juce::ScopedLock sl(processLock);
-    
-    unloadPlugin();
+    if (rackInstances.size() >= bridge::maxRackSlots)
+    {
+        writeLog("Rack is full; maximum is " + juce::String(bridge::maxRackSlots));
+        return false;
+    }
     pendingPluginState.reset();
     const auto bundle = bridge::vst3BundleRoot(juce::File(path));
     const auto loadPath = bundle.getFullPathName();
@@ -280,7 +270,9 @@ bool VST3HostEngine::loadPlugin(const juce::String& path, bool restoreSavedState
     auto instance = formatManager.createPluginInstance(desc, sampleRate, blockSize, errorMsg);
     if (instance != nullptr)
     {
-        pluginInstance = std::move(instance);
+        rackInstances.push_back({ loadPath, std::move(instance) });
+        selectedRackSlot = static_cast<int>(rackInstances.size()) - 1;
+        pluginInstance = rackInstances.back().plugin.get();
         pluginInstance->setPlayHead(&playHead);
         pluginInstance->setNonRealtime(false);
         useDoublePrecision = pluginInstance->supportsDoublePrecisionProcessing();
@@ -424,7 +416,7 @@ bool VST3HostEngine::consumeBypassRequested()
 
 void VST3HostEngine::quarantineFailedPlugin(const juce::String& path)
 {
-    writeLog("Quarantining failed plugin and entering bridge bypass: " + path);
+    writeLog("Quarantining failed rack slot: " + path);
     const auto canonical = bridge::canonicalPath(juce::File(path));
     const juce::ScopedLock lock(stateLock);
     for (auto& record : settings.plugins)
@@ -437,8 +429,8 @@ void VST3HostEngine::quarantineFailedPlugin(const juce::String& path)
             break;
         }
     }
-    pluginPrepared = false;
-    bypassRequested = true;
+    for (const auto& slot : rackInstances)
+        if (slot.path.equalsIgnoreCase(path)) slot.plugin->suspendProcessing(true);
 }
 
 void VST3HostEngine::markPluginLoadFailure(const juce::String& path, const juce::String& error)
@@ -460,8 +452,8 @@ void VST3HostEngine::removePluginFromList(const juce::String& path)
     if (path.isEmpty())
         return;
 
-    if (activePluginPath.equalsIgnoreCase(path))
-        unloadPlugin();
+    for (int i = static_cast<int>(rackInstances.size()); --i >= 0;)
+        if (rackInstances[static_cast<size_t>(i)].path.equalsIgnoreCase(path)) removeRackSlot(i);
 
     juce::PluginDescription descToRemove;
     bool found = false;
@@ -486,31 +478,162 @@ void VST3HostEngine::removePluginFromList(const juce::String& path)
             if (settings.plugins.getReference(i).canonicalPath.equalsIgnoreCase(canonical)) settings.plugins.remove(i);
     }
 
-    writeLog("Removed plugin from dropdown: " + path);
+    writeLog("Removed plugin from rack menu: " + path);
     saveState();
 }
 
 void VST3HostEngine::unloadPlugin()
 {
-    if (pluginInstance != nullptr) saveState();
+    if (!rackInstances.empty()) saveState();
     const juce::ScopedLock sl(processLock);
-    if (pluginInstance != nullptr)
+    for (auto& slot : rackInstances)
     {
-        writeLog("Retiring plugin without unloading module: " + activePluginPath);
-        pluginInstance->suspendProcessing(true);
-        const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
-        pluginInstance->setPlayHead(nullptr);
-        pluginInstance->removeListener(this);
-        pluginInstance->reset();
-        pluginInstance->releaseResources();
-        getRetiredPlugins().push_back(std::move(pluginInstance));
-        writeLog("Plugin retired; retiredCount=" + juce::String((int)getRetiredPlugins().size()));
+        writeLog("Retiring rack plugin without unloading module: " + slot.path);
+        slot.plugin->suspendProcessing(true);
+        const juce::ScopedLock callbackLock(slot.plugin->getCallbackLock());
+        slot.plugin->setPlayHead(nullptr);
+        slot.plugin->removeListener(this);
+        slot.plugin->reset();
+        slot.plugin->releaseResources();
+        getRetiredPlugins().push_back(std::move(slot.plugin));
     }
+    rackInstances.clear();
+    pluginInstance = nullptr;
+    selectedRackSlot = -1;
     activePluginPath = "";
     pluginPrepared = false;
     useDoublePrecision = false;
     playHead.reset();
     processedSamples = 0;
+}
+
+juce::StringArray VST3HostEngine::getRackPluginPaths() const
+{
+    juce::StringArray result;
+    for (const auto& slot : rackInstances) result.add(slot.path);
+    return result;
+}
+
+juce::AudioPluginInstance* VST3HostEngine::getRackPluginInstance(int index) const
+{
+    return juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))
+        ? rackInstances[static_cast<size_t>(index)].plugin.get() : nullptr;
+}
+
+bool VST3HostEngine::isRackSlotMuted(int index) const
+{
+    return juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))
+        && rackInstances[static_cast<size_t>(index)].muted;
+}
+
+bool VST3HostEngine::isRackSlotSolo(int index) const
+{
+    return juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))
+        && rackInstances[static_cast<size_t>(index)].solo;
+}
+
+int VST3HostEngine::getRackSlotEditorHeight(int index) const
+{
+    return juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))
+        ? rackInstances[static_cast<size_t>(index)].editorHeight : 0;
+}
+
+void VST3HostEngine::setRackSlotMuted(int index, bool muted)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))) return;
+    const juce::ScopedLock sl(processLock);
+    rackInstances[static_cast<size_t>(index)].muted = muted;
+    saveState();
+}
+
+void VST3HostEngine::setRackSlotSolo(int index, bool solo)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))) return;
+    const juce::ScopedLock sl(processLock);
+    rackInstances[static_cast<size_t>(index)].solo = solo;
+    saveState();
+}
+
+void VST3HostEngine::setRackSlotEditorHeight(int index, int height)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))) return;
+    rackInstances[static_cast<size_t>(index)].editorHeight = juce::jlimit(120, 2400, height);
+    saveState();
+}
+
+void VST3HostEngine::selectRackSlot(int index)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))) return;
+    selectedRackSlot = index;
+    pluginInstance = rackInstances[static_cast<size_t>(index)].plugin.get();
+    activePluginPath = rackInstances[static_cast<size_t>(index)].path;
+    ++editorStateRevision;
+}
+
+void VST3HostEngine::moveRackSlot(int from, int to)
+{
+    const auto size = static_cast<int>(rackInstances.size());
+    if (!juce::isPositiveAndBelow(from, size) || !juce::isPositiveAndBelow(to, size) || from == to) return;
+    const juce::ScopedLock sl(processLock);
+    auto slot = std::move(rackInstances[static_cast<size_t>(from)]);
+    rackInstances.erase(rackInstances.begin() + from);
+    rackInstances.insert(rackInstances.begin() + to, std::move(slot));
+    selectedRackSlot = to;
+    pluginInstance = rackInstances[static_cast<size_t>(to)].plugin.get();
+    activePluginPath = rackInstances[static_cast<size_t>(to)].path;
+    ++editorStateRevision;
+    saveState();
+}
+
+void VST3HostEngine::removeRackSlot(int index)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))) return;
+    saveState();
+    const juce::ScopedLock sl(processLock);
+    auto& slot = rackInstances[static_cast<size_t>(index)];
+    slot.plugin->suspendProcessing(true);
+    slot.plugin->setPlayHead(nullptr);
+    slot.plugin->removeListener(this);
+    slot.plugin->releaseResources();
+    getRetiredPlugins().push_back(std::move(slot.plugin));
+    rackInstances.erase(rackInstances.begin() + index);
+    pluginPrepared = false;
+    if (rackInstances.empty())
+    {
+        selectedRackSlot = -1; pluginInstance = nullptr; activePluginPath.clear();
+    }
+    else selectRackSlot(juce::jmin(index, static_cast<int>(rackInstances.size()) - 1));
+    saveState();
+}
+
+void VST3HostEngine::clearRack()
+{
+    unloadPlugin();
+    saveState();
+}
+
+bool VST3HostEngine::cloneRackSlot(int index, int insertAt)
+{
+    if (!juce::isPositiveAndBelow(index, static_cast<int>(rackInstances.size()))
+        || rackInstances.size() >= bridge::maxRackSlots) return false;
+    juce::MemoryBlock state;
+    const auto path = rackInstances[static_cast<size_t>(index)].path;
+    const auto muted = rackInstances[static_cast<size_t>(index)].muted;
+    const auto solo = rackInstances[static_cast<size_t>(index)].solo;
+    const auto editorHeight = rackInstances[static_cast<size_t>(index)].editorHeight;
+    {
+        const juce::ScopedLock callbackLock(rackInstances[static_cast<size_t>(index)].plugin->getCallbackLock());
+        rackInstances[static_cast<size_t>(index)].plugin->getStateInformation(state);
+    }
+    if (!loadPlugin(path, false)) return false;
+    pluginInstance->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    rackInstances.back().muted = muted;
+    rackInstances.back().solo = solo;
+    rackInstances.back().editorHeight = editorHeight;
+    moveRackSlot(static_cast<int>(rackInstances.size()) - 1,
+                 juce::jlimit(0, static_cast<int>(rackInstances.size()) - 1, insertAt));
+    saveState();
+    return true;
 }
 
 int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numChannels, int sampleRate)
@@ -574,11 +697,12 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         return numFrames;
     }
     
-    if (pluginInstance == nullptr)
+    if (rackInstances.empty())
         return numFrames;
     
     // Check if format changed and re-prepare if necessary
-    if (sampleRate != currentSampleRate || numChannels != currentNumChannels || numFrames > currentBlockSize)
+    if (bridge::rackNeedsPreparation(pluginPrepared, currentSampleRate, currentNumChannels, currentBlockSize,
+                                     sampleRate, numChannels, numFrames))
     {
         pluginPrepared = preparePlugin(sampleRate, numChannels, numFrames);
     }
@@ -587,169 +711,52 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         return numFrames;
 
     playHead.update(sampleRate, numFrames, processedSamples);
-    if (useDoublePrecision)
+    floatBuffer.setSize(numChannels, numFrames, false, false, true);
+
+    for (int c = 0; c < numChannels; ++c)
     {
-        doubleBuffer.setSize(numChannels, numFrames, false, false, true);
-
-        for (int c = 0; c < numChannels; ++c)
+        float* dest = floatBuffer.getWritePointer(c);
+        for (int i = 0; i < numFrames; ++i)
         {
-            double* dest = doubleBuffer.getWritePointer(c);
-            for (int i = 0; i < numFrames; ++i)
-            {
-                const auto sampleIndex = i * numChannels + c;
-
-                if (bps == 8)
-                    dest[i] = (static_cast<int>(bytes[sampleIndex]) - 128) / 128.0;
-                else if (bps == 16)
-                    dest[i] = reinterpret_cast<const int16_t*>(samples)[sampleIndex] / 32768.0;
-                else if (bps == 24)
-                {
-                    const auto* p = bytes + sampleIndex * 3;
-                    int32_t v = static_cast<int32_t>(p[0])
-                              | (static_cast<int32_t>(p[1]) << 8)
-                              | (static_cast<int32_t>(p[2]) << 16);
-                    if ((v & 0x00800000) != 0)
-                        v |= static_cast<int32_t>(0xff000000);
-                    dest[i] = v / 8388608.0;
-                }
-                else
-                    dest[i] = reinterpret_cast<const int32_t*>(samples)[sampleIndex] / 2147483648.0;
-            }
-        }
-
-        midiBuffer.clear();
-        {
-            const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
-            if (pluginInstance->isSuspended())
-                return numFrames;
-
-            try
-            {
-                if (!processBlockSafely(*pluginInstance, doubleBuffer, midiBuffer))
-                {
-                    const auto failedPath = activePluginPath;
-                    writeLog("Process block failed with Windows structured exception; bypassing bridge");
-                    quarantineFailedPlugin(failedPath);
-                    return numFrames;
-                }
-            }
-            catch (...)
-            {
-                const auto failedPath = activePluginPath;
-                writeLog("Process block failed with C++ exception; bypassing bridge");
-                quarantineFailedPlugin(failedPath);
-                return numFrames;
-            }
-        }
-
-        for (int c = 0; c < numChannels; ++c)
-        {
-            const double* src = doubleBuffer.getReadPointer(c);
-            for (int i = 0; i < numFrames; ++i)
-            {
-                auto val = sanitizeOutputSample(src[i], blockClippedSamples, blockNonFiniteSamples, blockMaxMilliAbs);
-                const auto sampleIndex = i * numChannels + c;
-
-                if (bps == 8)
-                    bytes[sampleIndex] = static_cast<unsigned char>(juce::jlimit(0, 255, juce::roundToInt(val * 127.0 + 128.0)));
-                else if (bps == 16)
-                    reinterpret_cast<int16_t*>(samples)[sampleIndex] = static_cast<int16_t>(val * 32767.0);
-                else if (bps == 24)
-                {
-                    const auto v = juce::jlimit(-8388608, 8388607, juce::roundToInt(val * 8388607.0));
-                    auto* p = bytes + sampleIndex * 3;
-                    p[0] = static_cast<unsigned char>(v & 0xff);
-                    p[1] = static_cast<unsigned char>((v >> 8) & 0xff);
-                    p[2] = static_cast<unsigned char>((v >> 16) & 0xff);
-                }
-                else
-                    reinterpret_cast<int32_t*>(samples)[sampleIndex] = static_cast<int32_t>(juce::jlimit(-2147483647.0, 2147483647.0, val * 2147483647.0));
-            }
+            const auto sampleIndex = i * numChannels + c;
+            dest[i] = static_cast<float>(readInterleavedSample(samples, bytes, bps, sampleIndex));
         }
     }
-    else
+
+    // ponytail: one float chain keeps mixed plug-in capabilities simple; add per-slot
+    // precision conversion only if a measured plug-in requires double processing.
+    const auto anySolo = std::any_of(rackInstances.begin(), rackInstances.end(), [](const auto& slot) { return slot.solo; });
+    for (const auto& slot : rackInstances)
     {
-        floatBuffer.setSize(numChannels, numFrames, false, false, true);
-
-        for (int c = 0; c < numChannels; ++c)
-        {
-            float* dest = floatBuffer.getWritePointer(c);
-            for (int i = 0; i < numFrames; ++i)
-            {
-                const auto sampleIndex = i * numChannels + c;
-
-                if (bps == 8)
-                    dest[i] = (static_cast<int>(bytes[sampleIndex]) - 128) / 128.0f;
-                else if (bps == 16)
-                    dest[i] = reinterpret_cast<const int16_t*>(samples)[sampleIndex] / 32768.0f;
-                else if (bps == 24)
-                {
-                    const auto* p = bytes + sampleIndex * 3;
-                    int32_t v = static_cast<int32_t>(p[0])
-                              | (static_cast<int32_t>(p[1]) << 8)
-                              | (static_cast<int32_t>(p[2]) << 16);
-                    if ((v & 0x00800000) != 0)
-                        v |= static_cast<int32_t>(0xff000000);
-                    dest[i] = static_cast<float>(v / 8388608.0);
-                }
-                else
-                    dest[i] = static_cast<float>(reinterpret_cast<const int32_t*>(samples)[sampleIndex] / 2147483648.0);
-            }
-        }
-
+        if (slot.muted || (anySolo && !slot.solo)) continue;
         midiBuffer.clear();
+        auto& processor = *slot.plugin;
+        const juce::ScopedLock callbackLock(processor.getCallbackLock());
+        if (processor.isSuspended()) continue;
+        try
         {
-            const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
-            if (pluginInstance->isSuspended())
-                return numFrames;
-
-            try
+            if (!processBlockSafely(processor, floatBuffer, midiBuffer))
             {
-                if (!processBlockSafely(*pluginInstance, floatBuffer, midiBuffer))
-                {
-                    const auto failedPath = activePluginPath;
-                    writeLog("Process block failed with Windows structured exception; bypassing bridge");
-                    quarantineFailedPlugin(failedPath);
-                    return numFrames;
-                }
-            }
-            catch (...)
-            {
-                const auto failedPath = activePluginPath;
-                writeLog("Process block failed with C++ exception; bypassing bridge");
-                quarantineFailedPlugin(failedPath);
+                writeLog("Rack process block failed with Windows structured exception: " + slot.path);
+                quarantineFailedPlugin(slot.path);
                 return numFrames;
             }
         }
-
-        for (int c = 0; c < numChannels; ++c)
+        catch (...)
         {
-            const float* src = floatBuffer.getReadPointer(c);
-            for (int i = 0; i < numFrames; ++i)
-            {
-                auto val = static_cast<float>(sanitizeOutputSample(src[i], blockClippedSamples, blockNonFiniteSamples, blockMaxMilliAbs));
-                const auto sampleIndex = i * numChannels + c;
-
-                if (bps == 8)
-                    bytes[sampleIndex] = static_cast<unsigned char>(juce::jlimit(0, 255, juce::roundToInt(val * 127.0f + 128.0f)));
-                else if (bps == 16)
-                    reinterpret_cast<int16_t*>(samples)[sampleIndex] = static_cast<int16_t>(val * 32767.0f);
-                else if (bps == 24)
-                {
-                    const auto v = juce::jlimit(-8388608, 8388607, juce::roundToInt(val * 8388607.0f));
-                    auto* p = bytes + sampleIndex * 3;
-                    p[0] = static_cast<unsigned char>(v & 0xff);
-                    p[1] = static_cast<unsigned char>((v >> 8) & 0xff);
-                    p[2] = static_cast<unsigned char>((v >> 16) & 0xff);
-                }
-                else
-                {
-                    const auto scaled = static_cast<double>(val) * 2147483647.0;
-                    reinterpret_cast<int32_t*>(samples)[sampleIndex] = static_cast<int32_t>(juce::jlimit(-2147483647.0, 2147483647.0, scaled));
-                }
-            }
+            writeLog("Rack process block failed with C++ exception: " + slot.path);
+            quarantineFailedPlugin(slot.path);
+            return numFrames;
         }
     }
+
+    for (int c = 0; c < numChannels; ++c)
+        for (int i = 0; i < numFrames; ++i)
+        {
+            const auto value = sanitizeOutputSample(floatBuffer.getSample(c, i), blockClippedSamples,
+                                                    blockNonFiniteSamples, blockMaxMilliAbs);
+            writeInterleavedSample(samples, bytes, bps, i * numChannels + c, value);
+        }
 
     if (smoothNextProcessedBlock)
     {
@@ -784,59 +791,39 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
     pluginPrepared = false;
     lastOutputTail.ensureStorageAllocated(numChannels);
     
-    if (pluginInstance == nullptr)
+    if (rackInstances.empty())
         return false;
-        
-    writeLog("Preparing plugin: sampleRate=" + juce::String(sampleRate)
+
+    writeLog("Preparing rack: sampleRate=" + juce::String(sampleRate)
              + " channels=" + juce::String(numChannels)
              + " blockSize=" + juce::String(currentBlockSize));
-
-    pluginInstance->releaseResources();
-    pluginInstance->setPlayHead(&playHead);
-    pluginInstance->setNonRealtime(false);
-    if (pluginInstance->supportsDoublePrecisionProcessing())
+    for (const auto& slot : rackInstances)
     {
-        useDoublePrecision = true;
-        pluginInstance->setProcessingPrecision(juce::AudioProcessor::doublePrecision);
+        auto& processor = *slot.plugin;
+        processor.releaseResources();
+        processor.setPlayHead(&playHead);
+        processor.setNonRealtime(false);
+        processor.setProcessingPrecision(juce::AudioProcessor::singlePrecision);
+        processor.disableNonMainBuses();
+
+        juce::AudioProcessor::BusesLayout layout;
+        const auto mainLayout = juce::AudioChannelSet::canonicalChannelSet(numChannels);
+        for (int i = 0; i < processor.getBusCount(true); ++i)
+            layout.inputBuses.add(i == 0 ? mainLayout : juce::AudioChannelSet::disabled());
+        for (int i = 0; i < processor.getBusCount(false); ++i)
+            layout.outputBuses.add(i == 0 ? mainLayout : juce::AudioChannelSet::disabled());
+        if (!processor.setBusesLayout(layout))
+            processor.setPlayConfigDetails(numChannels, numChannels, sampleRate, currentBlockSize);
+        processor.setRateAndBufferSizeDetails(sampleRate, currentBlockSize);
+        processor.prepareToPlay(sampleRate, currentBlockSize);
+        writeLog("Prepared rack slot: " + slot.path + "; latency=" + juce::String(processor.getLatencySamples()));
     }
-    else
-    {
-        useDoublePrecision = false;
-        pluginInstance->setProcessingPrecision(juce::AudioProcessor::singlePrecision);
-    }
-    
-    // AIMP's DSP pipeline is a single main bus. Commercial VST3s often expose
-    // sidechain/aux buses by default; leave those disabled so the process
-    // buffer contains only the main input/output channels.
-    pluginInstance->disableNonMainBuses();
-
-    juce::AudioProcessor::BusesLayout layout;
-    const auto mainLayout = juce::AudioChannelSet::canonicalChannelSet(numChannels);
-
-    for (int i = 0; i < pluginInstance->getBusCount(true); ++i)
-        layout.inputBuses.add(i == 0 ? mainLayout : juce::AudioChannelSet::disabled());
-
-    for (int i = 0; i < pluginInstance->getBusCount(false); ++i)
-        layout.outputBuses.add(i == 0 ? mainLayout : juce::AudioChannelSet::disabled());
-    
-    if (!pluginInstance->setBusesLayout(layout))
-    {
-        writeLog("setBusesLayout with disabled non-main buses rejected; falling back to setPlayConfigDetails");
-        pluginInstance->setPlayConfigDetails(numChannels, numChannels, sampleRate, currentBlockSize);
-    }
-
-    pluginInstance->setRateAndBufferSizeDetails(sampleRate, currentBlockSize);
-    pluginInstance->prepareToPlay(sampleRate, currentBlockSize);
     pluginPrepared = true;
+    useDoublePrecision = false;
     processLogCountdown = 8;
     processedSamples = 0;
 
-    writeLog("Prepare complete: inputs=" + juce::String(pluginInstance->getTotalNumInputChannels())
-             + " outputs=" + juce::String(pluginInstance->getTotalNumOutputChannels())
-             + " latency=" + juce::String(pluginInstance->getLatencySamples())
-             + " tail=" + juce::String(pluginInstance->getTailLengthSeconds())
-             + " precision=" + juce::String(useDoublePrecision ? "double" : "float"));
-    writeLog("Prepared bus state:" + describeBuses(*pluginInstance));
+    writeLog("Rack prepare complete; slots=" + juce::String(static_cast<int>(rackInstances.size())));
     return true;
 }
 
@@ -873,27 +860,32 @@ void VST3HostEngine::saveState()
             writeLog("Safe startup configuration saved without replacing the preserved plugin state");
         return;
     }
-    settings.activePlugin = activePluginPath.isEmpty() ? bridge::PathReference{}
-        : bridge::PathReference::fromFile(juce::File(activePluginPath), runtimePaths);
+    settings.rack.clear();
     std::size_t savedStateBytes = 0;
-    if (pluginInstance != nullptr)
+    for (const auto& slot : rackInstances)
     {
         stateDirtyAt = 0;
-        const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
+        const juce::ScopedLock callbackLock(slot.plugin->getCallbackLock());
         juce::MemoryBlock stateData;
-        pluginInstance->getStateInformation(stateData);
-        savedStateBytes = stateData.getSize();
-        settings.pluginState = stateData.toBase64Encoding();
-        const auto canonical = bridge::canonicalPath(juce::File(activePluginPath));
+        slot.plugin->getStateInformation(stateData);
+        savedStateBytes += stateData.getSize();
+        const auto encoded = stateData.toBase64Encoding();
+        settings.rack.add({ bridge::PathReference::fromFile(juce::File(slot.path), runtimePaths), encoded,
+                            slot.muted, slot.solo, slot.editorHeight });
+        const auto canonical = bridge::canonicalPath(juce::File(slot.path));
         for (auto& record : settings.plugins)
-            if (record.canonicalPath.equalsIgnoreCase(canonical)) { record.state = settings.pluginState; break; }
+            if (record.canonicalPath.equalsIgnoreCase(canonical)) { record.state = encoded; break; }
     }
+    settings.activePlugin = activePluginPath.isEmpty() ? bridge::PathReference{}
+        : bridge::PathReference::fromFile(juce::File(activePluginPath), runtimePaths);
+    settings.pluginState = juce::isPositiveAndBelow(selectedRackSlot, settings.rack.size())
+        ? settings.rack[selectedRackSlot].state : juce::String();
     juce::String error;
     if (!configStore->save(settings, &error))
         writeLog("Configuration save failed: " + error);
     else
-        writeLog("Configuration saved; activePlugin=" + (activePluginPath.isNotEmpty() ? activePluginPath : "[Bypass]")
-                 + "; pluginStateBytes=" + juce::String(static_cast<juce::int64>(savedStateBytes)));
+        writeLog("Rack configuration saved; slots=" + juce::String(settings.rack.size())
+                 + "; stateBytes=" + juce::String(static_cast<juce::int64>(savedStateBytes)));
 }
 
 void VST3HostEngine::flushPendingStateSave()
@@ -917,26 +909,23 @@ void VST3HostEngine::loadState(bool restorePlugin)
         return;
     }
 
-    bridge::PathReference selected;
-    if (settings.startupMode != "none") selected = settings.activePlugin;
-    const auto path = selected.resolve(runtimePaths);
-    writeLog("Restoring startup state; mode=" + settings.startupMode
-             + "; selected=" + (selected.path.isNotEmpty() ? path.getFullPathName() : "[Bypass]")
-             + "; encodedStateChars=" + juce::String(settings.pluginState.length()));
-    if (!path.exists() || selected.path.isEmpty()) return;
-
-    const auto canonical = bridge::canonicalPath(path);
-    for (const auto& record : settings.plugins)
-        if (record.canonicalPath.equalsIgnoreCase(canonical)
-            && (record.runtimeQuarantined || record.scannerQuarantined || record.status != "Compatible"))
-            return;
-
-    if (loadPlugin(path.getFullPathName()) && pluginInstance != nullptr)
+    if (settings.startupMode == "none") return;
+    const auto savedRack = settings.rack;
+    writeLog("Restoring rack; slots=" + juce::String(savedRack.size()));
+    for (const auto& savedSlot : savedRack)
     {
-        if (pendingPluginState.isEmpty() && settings.pluginState.isNotEmpty())
-            pendingPluginState.fromBase64Encoding(settings.pluginState);
-        writeLog("Plugin state decoded; bytes="
-                 + juce::String(static_cast<juce::int64>(pendingPluginState.getSize())));
+        const auto path = savedSlot.plugin.resolve(runtimePaths);
+        if (!path.exists()) continue;
+        const auto canonical = bridge::canonicalPath(path);
+        bool compatible = true;
+        for (const auto& record : settings.plugins)
+            if (record.canonicalPath.equalsIgnoreCase(canonical))
+                compatible = !record.runtimeQuarantined && !record.scannerQuarantined && record.status == "Compatible";
+        if (!compatible || !loadPlugin(path.getFullPathName(), false)) continue;
+        rackInstances.back().muted = savedSlot.muted;
+        rackInstances.back().solo = savedSlot.solo;
+        rackInstances.back().editorHeight = savedSlot.editorHeight;
+        pendingPluginState.fromBase64Encoding(savedSlot.state);
         applyPendingPluginState();
     }
 }
@@ -958,7 +947,7 @@ void VST3HostEngine::applyPendingPluginState()
 
 VST3HostEngine::ScanThread::ScanThread(VST3HostEngine& ownerIn, juce::Array<juce::File> filesIn,
                                        juce::Array<bridge::ScanFolder> foldersIn, bool forceIn, juce::File loadAfterScanIn)
-    : juce::Thread("VST3 bridge scanner"), owner(ownerIn), files(std::move(filesIn)),
+    : juce::Thread("VST3 rack scanner"), owner(ownerIn), files(std::move(filesIn)),
       folders(std::move(foldersIn)), force(forceIn), loadAfterScan(std::move(loadAfterScanIn))
 {
 }
@@ -1101,8 +1090,12 @@ void VST3HostEngine::resetScanCache()
 
 void VST3HostEngine::resetActivePluginParameters()
 {
+    const auto index = selectedRackSlot;
     const auto path = activePluginPath;
-    if (path.isEmpty() || !loadPlugin(path, false)) return;
+    if (path.isEmpty() || index < 0) return;
+    removeRackSlot(index);
+    if (!loadPlugin(path, false)) return;
+    moveRackSlot(static_cast<int>(rackInstances.size()) - 1, juce::jmin(index, static_cast<int>(rackInstances.size()) - 1));
     saveState();
     writeLog("Active plugin recreated with factory parameters: " + activePluginPath);
 }
@@ -1130,18 +1123,15 @@ juce::String VST3HostEngine::getDiagnostics() const
         runtimeQuarantine += plugin.runtimeQuarantined ? 1 : 0;
     }
     juce::String text;
-    text << "VST3 Bridge for AIMP\r\n"
+    text << "VST3 Bridge Rack For AIMP\r\n"
          << "Bridge version: " << bridge::bridgeVersion << " (config schema " << bridge::configSchemaVersion << ")\r\n"
          << "AIMP SDK: " << bridge::aimpSdkVersion << "\r\n"
          << "IPC version: " << VST3_BRIDGE_IPC_VERSION << "\r\n"
          << "Helper architecture: " << bridge::architectureName(bridge::currentArchitecture()) << "\r\n"
          << "Process DPI awareness: " << (AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) ? "PerMonitorV2" : "other") << "\r\n"
          << "System DPI: " << GetDpiForSystem() << " (" << juce::roundToInt(GetDpiForSystem() * 100.0 / 96.0) << "%)\r\n"
-         << "Saved monitor: " << snapshot.monitorName << "; saved DPI: " << snapshot.savedDpi << "\r\n"
-         << "Logical bounds: " << snapshot.logicalWindowBounds[0] << "," << snapshot.logicalWindowBounds[1] << ","
-         << snapshot.logicalWindowBounds[2] << "x" << snapshot.logicalWindowBounds[3] << "\r\n"
-         << "Visualizer: " << (snapshot.visualizerMode ? "yes" : "no") << "; fullscreen: " << (snapshot.fullscreen ? "yes" : "no") << "\r\n"
          << "Active plugin: " << (activePluginPath.isNotEmpty() ? activePluginPath : "[Bypass]") << "\r\n"
+         << "Rack slots: " << static_cast<int>(rackInstances.size()) << "/" << bridge::maxRackSlots << "\r\n"
          << "Configuration: " << runtimePaths.activeConfig.getFullPathName() << "\r\n"
          << "Bridge root: " << runtimePaths.packageRoot.getFullPathName() << "\r\n"
          << "Log: " << runtimePaths.logFile.getFullPathName() << "\r\n"
@@ -1164,6 +1154,8 @@ void VST3HostEngine::requestHostArchitecture(const bridge::PluginRecord& plugin)
         const juce::ScopedLock lock(stateLock);
         settings.activePlugin = plugin.location;
         settings.pluginState = plugin.state;
+        settings.rack.clear();
+        settings.rack.add({ plugin.location, plugin.state });
     }
     juce::String error;
     if (configStore != nullptr && !configStore->save(settings, &error))

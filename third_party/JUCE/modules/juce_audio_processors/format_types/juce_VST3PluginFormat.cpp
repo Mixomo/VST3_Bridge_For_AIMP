@@ -297,7 +297,7 @@ struct VST3PluginWindow final : public AudioProcessorEditor,
 
     void paint (Graphics& g) override
     {
-        g.fillAll (Colour (0xff1e1e1e));
+        g.fillAll (findColour (ResizableWindow::backgroundColourId, true));
     }
 
     void mouseWheelMove (const MouseEvent&, const MouseWheelDetails& wheel) override
@@ -548,13 +548,13 @@ private:
                 setHWND (peer->getNativeHandle());
         }
 
-        void paint (Graphics& g) override { g.fillAll (Colour (0xff1e1e1e)); }
+        void paint (Graphics& g) override { g.fillAll (findColour (ResizableWindow::backgroundColourId, true)); }
 
     private:
         struct Inner final : public Component
         {
             Inner() { setOpaque (true); }
-            void paint (Graphics& g) override { g.fillAll (Colour (0xff1e1e1e)); }
+            void paint (Graphics& g) override { g.fillAll (findColour (ResizableWindow::backgroundColourId, true)); }
         };
 
         Inner inner;

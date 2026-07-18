@@ -162,9 +162,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         VST3HostEngine::getInstance().init(instance, paths);
         bool ready = false;
         {
-            VST3HostEngine::getInstance().writeLog("Startup smoke creating bridge window");
+            VST3HostEngine::getInstance().writeLog("Startup smoke creating rack window");
             HostWindow window(true);
-            VST3HostEngine::getInstance().writeLog("Startup smoke bridge window created; pumping editor messages");
+            window.keyPressed(juce::KeyPress(juce::KeyPress::downKey));
+            VST3HostEngine::getInstance().writeLog("Startup smoke rack window created; pumping editor messages");
             ready = pumpUntilEditorInitialised(window, 3000);
             window.finishPreload(false);
         }
@@ -213,7 +214,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         VST3HostEngine::getInstance().writeLog("GUI preload failed");
         return 4;
     }
-    hostWindow->finishPreload(false);
+    hostWindow->finishPreload(VST3HostEngine::getInstance().getSettingsSnapshot().openRackOnStartup);
     VST3HostEngine::getInstance().writeLog("GUI preload completed");
     VST3HostEngine::getInstance().writeLog("Out-of-process host ready for audio and GUI events");
 
@@ -248,14 +249,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             serviceGuiRequest();
         }
         else if (result == WAIT_OBJECT_0 + 2)
-        {
             VST3HostEngine::getInstance().writeLog("Out-of-process host received DSP start event");
-            if (VST3HostEngine::getInstance().getSettingsSnapshot().openEditorOnStart)
-            {
-                showHostWindow();
-                VST3HostEngine::getInstance().writeLog("Out-of-process host auto-opened GUI window");
-            }
-        }
         else if (result == WAIT_OBJECT_0 + 4)
         {
             MSG message {};

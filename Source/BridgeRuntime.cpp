@@ -129,6 +129,31 @@ namespace
         return result;
     }
 
+    juce::var rackSlotToVar(const RackSlot& slot)
+    {
+        auto* object = new juce::DynamicObject();
+        object->setProperty("plugin", slot.plugin.toVar());
+        object->setProperty("state", slot.state);
+        object->setProperty("muted", slot.muted);
+        object->setProperty("solo", slot.solo);
+        object->setProperty("editorHeight", slot.editorHeight);
+        return juce::var(object);
+    }
+
+    RackSlot rackSlotFromVar(const juce::var& value)
+    {
+        RackSlot result;
+        if (auto* object = value.getDynamicObject())
+        {
+            result.plugin = PathReference::fromVar(object->getProperty("plugin"));
+            result.state = object->getProperty("state").toString();
+            result.muted = static_cast<bool>(object->getProperty("muted"));
+            result.solo = static_cast<bool>(object->getProperty("solo"));
+            result.editorHeight = juce::jlimit(0, 2400, static_cast<int>(object->getProperty("editorHeight")));
+        }
+        return result;
+    }
+
     void enumerateFolder(const juce::File& folder, bool recursive, juce::Array<juce::File>& output,
                          std::set<juce::String>& visited, std::atomic_bool* cancelled)
     {
@@ -223,15 +248,15 @@ RuntimePaths RuntimePaths::detect(const juce::File& executablePath, const juce::
         const auto localProfile = result.aimpRoot.getChildFile("Profile");
         if (localProfile.isDirectory()) result.aimpProfile = localProfile;
     }
-    result.portableConfig = result.packageRoot.getChildFile("dsp_vst3_bridge_config.json");
+    result.portableConfig = result.packageRoot.getChildFile("dsp_vst3_rack_config.json");
     result.userConfig = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-        .getChildFile("Mixomo").getChildFile("VST3 Bridge").getChildFile(makeInstanceId(result.packageRoot))
-        .getChildFile("dsp_vst3_bridge_config.json");
+        .getChildFile("Mixomo").getChildFile("VST3 Rack").getChildFile(makeInstanceId(result.packageRoot))
+        .getChildFile("dsp_vst3_rack_config.json");
     result.storageMode = requestedMode;
     const bool portableTree = result.aimpProfile != juce::File() && isWithin(result.packageRoot, result.aimpProfile);
     const bool wantsPortable = requestedMode == StorageMode::portable
         || (requestedMode == StorageMode::automatic && (result.portableConfig.existsAsFile()
-            || result.packageRoot.getChildFile("dsp_vst3_bridge.portable").existsAsFile() || portableTree));
+            || result.packageRoot.getChildFile("dsp_vst3_rack.portable").existsAsFile() || portableTree));
     if (wantsPortable && canWriteDirectory(result.packageRoot))
     {
         result.activeConfig = result.portableConfig;
@@ -244,7 +269,7 @@ RuntimePaths RuntimePaths::detect(const juce::File& executablePath, const juce::
         result.portableFallback = wantsPortable;
     }
     result.logFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getChildFile("dsp_vst3_bridge_" + makeInstanceId(result.packageRoot) + "_"
+        .getChildFile("dsp_vst3_rack_" + makeInstanceId(result.packageRoot) + "_"
                       + architectureName(currentArchitecture()) + "_" + juce::String::toHexString((int)GetCurrentProcessId()) + ".log");
     return result;
 }
@@ -252,17 +277,17 @@ RuntimePaths RuntimePaths::detect(const juce::File& executablePath, const juce::
 juce::File RuntimePaths::helper(Architecture architecture) const
 {
     const auto suffix = architecture == Architecture::x86 ? "32" : "64";
-    auto file = packageRoot.getChildFile("bin").getChildFile("VST3BridgeHost" + juce::String(suffix) + ".exe");
+    auto file = packageRoot.getChildFile("bin").getChildFile("VST3RackHost" + juce::String(suffix) + ".exe");
     if (file.existsAsFile()) return file;
-    return binaryDirectory.getChildFile("VST3BridgeHost.exe");
+    return binaryDirectory.getChildFile("VST3RackHost.exe");
 }
 
 juce::File RuntimePaths::scanner(Architecture architecture) const
 {
     const auto suffix = architecture == Architecture::x86 ? "32" : "64";
-    auto file = packageRoot.getChildFile("bin").getChildFile("VST3BridgeScanner" + juce::String(suffix) + ".exe");
+    auto file = packageRoot.getChildFile("bin").getChildFile("VST3RackScanner" + juce::String(suffix) + ".exe");
     if (file.existsAsFile()) return file;
-    return binaryDirectory.getChildFile("VST3BridgeScanner.exe");
+    return binaryDirectory.getChildFile("VST3RackScanner.exe");
 }
 
 juce::var PathReference::toVar() const
@@ -305,15 +330,7 @@ ConfigStore::ConfigStore(RuntimePaths paths) : runtimePaths(std::move(paths)) {}
 BridgeSettings ConfigStore::load()
 {
     BridgeSettings settings;
-    auto file = runtimePaths.activeConfig;
-    if (!file.existsAsFile())
-    {
-        const auto legacyUser = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-            .getChildFile("Mixomo").getChildFile("VST3 Bridge").getChildFile("dsp_vst3_bridge_config.json");
-        const auto legacyLocal = runtimePaths.binaryDirectory.getChildFile("dsp_vst3_config.json");
-        if (legacyUser.existsAsFile()) file = legacyUser;
-        else if (legacyLocal.existsAsFile()) file = legacyLocal;
-    }
+    const auto file = runtimePaths.activeConfig;
     auto root = juce::JSON::parse(file);
     if (root.getDynamicObject() == nullptr)
         root = juce::JSON::parse(runtimePaths.activeConfig.getSiblingFile(runtimePaths.activeConfig.getFileName() + ".bak"));
@@ -334,6 +351,7 @@ BridgeSettings ConfigStore::load()
         ? object->getProperty("activePlugin") : object->getProperty("activePluginPath"));
     settings.pluginState = object->getProperty("pluginState").toString();
     settings.scanOnStartup = false;
+    settings.openRackOnStartup = static_cast<bool>(object->getProperty("openRackOnStartup"));
     settings.scanBridgeFolder = object->hasProperty("scanBridgeFolder") ? static_cast<bool>(object->getProperty("scanBridgeFolder")) : true;
     settings.scanSystemFolders = static_cast<bool>(object->getProperty("scanSystemFolders"));
     settings.removeMissing = object->hasProperty("removeMissing") ? static_cast<bool>(object->getProperty("removeMissing")) : true;
@@ -341,26 +359,11 @@ BridgeSettings ConfigStore::load()
     const auto configuredTimeout = static_cast<int>(object->getProperty("scanTimeoutSeconds"));
     settings.scanTimeoutSeconds = juce::jlimit(1, 120,
         loadedSchemaVersion < 7 && configuredTimeout == 15 ? 20 : configuredTimeout > 0 ? configuredTimeout : 20);
-    settings.openEditorOnStart = static_cast<bool>(object->getProperty("openEditorOnStart"));
-    settings.visualizerMode = static_cast<bool>(object->getProperty("visualizerMode"));
-    settings.alwaysOnTop = static_cast<bool>(object->getProperty("alwaysOnTop"));
-    settings.fullscreen = static_cast<bool>(object->hasProperty("fullscreen")
-        ? object->getProperty("fullscreen") : object->getProperty("fullscreenOnStart"));
-    settings.rememberWindow = object->hasProperty("rememberWindow") ? static_cast<bool>(object->getProperty("rememberWindow")) : true;
-    settings.savedDpi = juce::jmax(96, static_cast<int>(object->getProperty("savedDpi")));
-    settings.monitorName = object->getProperty("monitorName").toString();
-    if (auto* bounds = object->getProperty("logicalWindowBounds").getArray(); bounds != nullptr && bounds->size() == 4)
-        settings.logicalWindowBounds = { static_cast<int>((*bounds)[0]), static_cast<int>((*bounds)[1]), static_cast<int>((*bounds)[2]), static_cast<int>((*bounds)[3]) };
-    else if (auto* oldBounds = object->getProperty("windowBounds").getArray(); oldBounds != nullptr && oldBounds->size() == 4)
-    {
-        const auto oldDpi = juce::jmax(96, static_cast<int>(object->getProperty("savedDpi")));
-        settings.logicalWindowBounds = { MulDiv(static_cast<int>((*oldBounds)[0]), 96, oldDpi),
-                                         MulDiv(static_cast<int>((*oldBounds)[1]), 96, oldDpi),
-                                         MulDiv(static_cast<int>((*oldBounds)[2]), 96, oldDpi),
-                                         MulDiv(static_cast<int>((*oldBounds)[3]), 96, oldDpi) };
-    }
     if (auto* folders = object->getProperty("scanFolders").getArray()) for (const auto& item : *folders) settings.scanFolders.add(folderFromVar(item));
     if (auto* plugins = object->getProperty("plugins").getArray()) for (const auto& item : *plugins) settings.plugins.add(pluginFromVar(item));
+    if (auto* rack = object->getProperty("rack").getArray())
+        for (const auto& item : *rack)
+            if (settings.rack.size() < maxRackSlots) settings.rack.add(rackSlotFromVar(item));
     if (settings.plugins.isEmpty())
     {
         if (auto* legacyPlugins = object->getProperty("scannedPlugins").getArray())
@@ -420,6 +423,8 @@ BridgeSettings ConfigStore::load()
         for (auto& plugin : settings.plugins)
             if (plugin.canonicalPath.equalsIgnoreCase(active)) { plugin.state = settings.pluginState; break; }
     }
+    if (settings.rack.isEmpty() && settings.activePlugin.path.isNotEmpty())
+        settings.rack.add({ settings.activePlugin, settings.pluginState });
 
     if (settings.scanFolders.isEmpty())
     {
@@ -438,28 +443,22 @@ bool ConfigStore::save(const BridgeSettings& settings, juce::String* error)
     object->setProperty("activePlugin", settings.activePlugin.toVar());
     object->setProperty("pluginState", settings.pluginState);
     object->setProperty("scanOnStartup", settings.scanOnStartup);
+    object->setProperty("openRackOnStartup", settings.openRackOnStartup);
     object->setProperty("scanBridgeFolder", settings.scanBridgeFolder);
     object->setProperty("scanSystemFolders", settings.scanSystemFolders);
     object->setProperty("removeMissing", settings.removeMissing);
     object->setProperty("retryQuarantined", settings.retryQuarantined);
     object->setProperty("scanTimeoutSeconds", settings.scanTimeoutSeconds);
-    object->setProperty("openEditorOnStart", settings.openEditorOnStart);
-    object->setProperty("visualizerMode", settings.visualizerMode);
-    object->setProperty("alwaysOnTop", settings.alwaysOnTop);
-    object->setProperty("fullscreen", settings.fullscreen);
-    object->setProperty("rememberWindow", settings.rememberWindow);
-    object->setProperty("savedDpi", settings.savedDpi);
-    object->setProperty("monitorName", settings.monitorName);
-    juce::Array<juce::var> bounds { settings.logicalWindowBounds[0], settings.logicalWindowBounds[1], settings.logicalWindowBounds[2], settings.logicalWindowBounds[3] };
-    object->setProperty("logicalWindowBounds", bounds);
     juce::Array<juce::var> folders; for (const auto& folder : settings.scanFolders) folders.add(folderToVar(folder));
     juce::Array<juce::var> plugins; for (const auto& plugin : settings.plugins) plugins.add(pluginToVar(plugin));
+    juce::Array<juce::var> rack; for (const auto& slot : settings.rack) rack.add(rackSlotToVar(slot));
     object->setProperty("scanFolders", folders);
     object->setProperty("plugins", plugins);
+    object->setProperty("rack", rack);
 
     const auto target = runtimePaths.activeConfig;
     target.getParentDirectory().createDirectory();
-    juce::InterProcessLock lock("VST3BridgeConfig_" + makeInstanceId(target));
+    juce::InterProcessLock lock("VST3RackConfig_" + makeInstanceId(target));
     if (!lock.enter(3000)) { if (error) *error = "Configuration is locked by another instance"; return false; }
     const auto temp = target.getSiblingFile(target.getFileName() + ".tmp");
     const auto backup = target.getSiblingFile(target.getFileName() + ".bak");
@@ -540,6 +539,12 @@ std::array<int, 2> comfortableWindowPhysicalSize(std::array<int, 2> displaySize)
     for (const auto tier : tiers)
         if (tier < displaySize[1]) targetHeight = tier;
     return { juce::roundToInt(static_cast<double>(displaySize[0]) * targetHeight / displaySize[1]), targetHeight };
+}
+
+bool rackNeedsPreparation(bool prepared, double currentSampleRate, int currentChannels, int currentBlockSize,
+                          double sampleRate, int channels, int blockSize)
+{
+    return !prepared || sampleRate != currentSampleRate || channels != currentChannels || blockSize > currentBlockSize;
 }
 
 juce::String makeInstanceId(const juce::File& packageRoot)

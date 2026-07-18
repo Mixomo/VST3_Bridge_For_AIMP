@@ -6,17 +6,16 @@
 
 namespace
 {
-    constexpr auto background = 0xff1e1e1e;
-    constexpr auto panel = 0xff2d2d2d;
-    constexpr int compactControlsHeight = 132;
-
-    juce::String monitorNameForWindow(HWND window)
-    {
-        MONITORINFOEXW info {};
-        info.cbSize = sizeof(info);
-        return GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &info)
-            ? juce::String(info.szDevice) : juce::String();
-    }
+    constexpr auto background = 0xff292929;
+    constexpr auto surface = 0xff343434;
+    constexpr auto surfaceRaised = 0xff414141;
+    constexpr auto activeSurface = 0xff5a3217;
+    constexpr auto accent = 0xffff8500;
+    constexpr auto mutedColour = 0xffc86400;
+    constexpr auto soloColour = 0xffffa12b;
+    constexpr int headerHeight = 70;
+    constexpr int cardHeaderHeight = 92;
+    constexpr int cardGap = 10;
 
     class FolderManagerComponent final : public juce::Component,
                                          private juce::ListBoxModel,
@@ -26,687 +25,1205 @@ namespace
     public:
         FolderManagerComponent()
         {
-            title.setText("VST3 Search Folders", juce::dontSendNotification);
-            title.setFont(juce::FontOptions(20.0f));
             list.setModel(this);
-            list.setRowHeight(36);
-            list.setColour(juce::ListBox::backgroundColourId, juce::Colour(panel));
-            title.setTooltip("Manual VST3 discovery locations. The bridge never scans these folders automatically.");
-            title.setColour(juce::Label::textColourId, juce::Colours::white);
-            for (auto* component : std::initializer_list<juce::Component*> { &title, &list, &enabled, &recursive,
-                                     &add, &remove, &open, &rescan, &scanAll, &cancel })
+            list.setRowHeight(34);
+            list.setColour(juce::ListBox::backgroundColourId, juce::Colour(surface));
+            for (auto* component : std::initializer_list<juce::Component*> { &list, &add, &remove, &scan, &cancel })
                 addAndMakeVisible(component);
-            enabled.setButtonText("Enabled"); recursive.setButtonText("Recursive");
-            add.setButtonText("Add Folder..."); remove.setButtonText("Remove"); open.setButtonText("Open Folder");
-            rescan.setButtonText("Rescan Selected"); scanAll.setButtonText("Scan All"); cancel.setButtonText("Cancel Scan");
-            enabled.setTooltip("Include this folder the next time Scan All is pressed. Disabling it keeps the folder saved but skips it.");
-            recursive.setTooltip("Also search every subfolder. Disable this to inspect only VST3 bundles directly inside the selected folder.");
-            add.setTooltip("Choose another folder and add it to the manual VST3 search list.");
-            remove.setTooltip("Forget this search location. Already discovered plugins remain in the plugin dropdown.");
-            open.setTooltip("Open the selected search location in Windows File Explorer.");
-            rescan.setTooltip("Scan only the selected folder now and refresh its known VST3 plugins.");
-            scanAll.setTooltip("Scan every enabled folder now. No automatic scan is performed at startup.");
-            cancel.setTooltip("Request cancellation of the current manual scan after the plugin currently being checked finishes.");
-            for (auto* button : std::initializer_list<juce::Button*> { &enabled, &recursive, &add, &remove, &open, &rescan, &scanAll, &cancel }) button->addListener(this);
-            refresh();
-            timerCallback();
-            startTimer(250);
-            setSize(900, 500);
+            add.setButtonText("Add Folder"); remove.setButtonText("Remove");
+            scan.setButtonText("Scan All"); cancel.setButtonText("Cancel");
+            add.setTooltip("Add a folder containing VST3 plug-ins to the saved scan locations.");
+            remove.setTooltip("Remove the selected scan folder; already discovered VST3 plug-ins remain available.");
+            scan.setTooltip("Scan every saved and enabled folder for VST3 plug-ins.");
+            cancel.setTooltip("Stop the current scan after the VST3 currently being inspected finishes.");
+            list.setTooltip("Saved folders used by Scan All. Select a row to remove it.");
+            for (auto* button : { &add, &remove, &scan, &cancel }) button->addListener(this);
+            refresh(); startTimer(250); setSize(820, 460);
         }
 
         int getNumRows() override { return settings.scanFolders.size(); }
         void paint(juce::Graphics& g) override { g.fillAll(juce::Colour(background)); }
         void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override
         {
-            if (selected) g.fillAll(juce::Colour(0xff3c5368));
+            if (selected) g.fillAll(juce::Colour(0xff304357));
             if (!juce::isPositiveAndBelow(row, settings.scanFolders.size())) return;
             const auto& folder = settings.scanFolders.getReference(row);
-            const auto resolved = folder.location.resolve(VST3HostEngine::getInstance().getRuntimePaths());
-            const auto text = juce::String(folder.enabled ? "[Enabled]  " : "[Disabled] ")
-                + resolved.getFullPathName() + "  |  " + (folder.recursive ? "Recursive" : "Top level")
-                + "  |  " + folder.location.base + "  |  " + (resolved.isDirectory() ? "Available" : "Missing");
+            const auto path = folder.location.resolve(VST3HostEngine::getInstance().getRuntimePaths()).getFullPathName();
             g.setColour(juce::Colours::whitesmoke);
-            g.drawFittedText(text, 8, 0, width - 16, height, juce::Justification::centredLeft, 1);
+            g.drawFittedText(path, 10, 0, width - 20, height, juce::Justification::centredLeft, 1);
         }
-
-        void selectedRowsChanged(int row) override
-        {
-            const bool valid = juce::isPositiveAndBelow(row, settings.scanFolders.size());
-            enabled.setEnabled(valid); recursive.setEnabled(valid); remove.setEnabled(valid); open.setEnabled(valid);
-            rescan.setEnabled(valid && !VST3HostEngine::getInstance().isScanning());
-            if (valid)
-            {
-                enabled.setToggleState(settings.scanFolders.getReference(row).enabled, juce::dontSendNotification);
-                recursive.setToggleState(settings.scanFolders.getReference(row).recursive, juce::dontSendNotification);
-            }
-        }
-
         void resized() override
         {
-            auto area = getLocalBounds().reduced(18);
-            title.setBounds(area.removeFromTop(32));
-            area.removeFromTop(6);
-            auto bottom = area.removeFromBottom(88);
-            auto toggles = bottom.removeFromTop(32);
-            enabled.setBounds(toggles.removeFromLeft(125));
-            toggles.removeFromLeft(10);
-            recursive.setBounds(toggles.removeFromLeft(135));
-            bottom.removeFromTop(10);
-            juce::FlexBox buttons;
-            buttons.flexDirection = juce::FlexBox::Direction::row;
-            buttons.justifyContent = juce::FlexBox::JustifyContent::spaceBetween;
-            for (auto* button : { &add, &remove, &open, &rescan, &scanAll, &cancel })
-                buttons.items.add(juce::FlexItem(*button).withMinWidth(130.0f).withHeight(36.0f));
-            buttons.performLayout(bottom.toFloat());
+            auto area = getLocalBounds().reduced(16);
+            auto buttons = area.removeFromBottom(38);
+            const auto buttonWidth = buttons.getWidth() / 4;
+            for (auto* button : { &add, &remove, &scan, &cancel })
+                button->setBounds(buttons.removeFromLeft(buttonWidth).reduced(3));
             list.setBounds(area);
         }
 
     private:
-        void timerCallback() override
-        {
-            const bool scanning = VST3HostEngine::getInstance().isScanning();
-            cancel.setEnabled(scanning);
-            cancel.setButtonText("Cancel Scan");
-            scanAll.setEnabled(!scanning);
-            scanAll.setButtonText(scanning ? "Scanning..." : "Scan All");
-            rescan.setEnabled(!scanning && juce::isPositiveAndBelow(list.getSelectedRow(), settings.scanFolders.size()));
-        }
-
         void refresh()
         {
             settings = VST3HostEngine::getInstance().getSettingsSnapshot();
             list.updateContent();
-            selectedRowsChanged(list.getSelectedRow());
         }
-
-        void commit()
+        void timerCallback() override
         {
-            VST3HostEngine::getInstance().updateSettings(settings);
-            list.repaint();
+            const auto scanning = VST3HostEngine::getInstance().isScanning();
+            scan.setEnabled(!scanning); cancel.setEnabled(scanning);
         }
-
         void buttonClicked(juce::Button* button) override
         {
-            const int row = list.getSelectedRow();
-            if (button == &enabled && juce::isPositiveAndBelow(row, settings.scanFolders.size()))
-            { settings.scanFolders.getReference(row).enabled = enabled.getToggleState(); commit(); }
-            else if (button == &recursive && juce::isPositiveAndBelow(row, settings.scanFolders.size()))
-            { settings.scanFolders.getReference(row).recursive = recursive.getToggleState(); commit(); }
-            else if (button == &remove && juce::isPositiveAndBelow(row, settings.scanFolders.size()))
-            { settings.scanFolders.remove(row); commit(); refresh(); }
-            else if (button == &open && juce::isPositiveAndBelow(row, settings.scanFolders.size()))
-                settings.scanFolders.getReference(row).location.resolve(VST3HostEngine::getInstance().getRuntimePaths()).startAsProcess();
-            else if (button == &rescan && juce::isPositiveAndBelow(row, settings.scanFolders.size()))
-                VST3HostEngine::getInstance().scanFolder(settings.scanFolders.getReference(row));
-            else if (button == &scanAll) VST3HostEngine::getInstance().scanAll(true);
-            else if (button == &cancel) VST3HostEngine::getInstance().cancelScan();
+            auto& engine = VST3HostEngine::getInstance();
+            if (button == &scan) engine.scanAll(true);
+            else if (button == &cancel) engine.cancelScan();
+            else if (button == &remove)
+            {
+                const auto row = list.getSelectedRow();
+                if (juce::isPositiveAndBelow(row, settings.scanFolders.size()))
+                { settings.scanFolders.remove(row); engine.updateSettings(settings); refresh(); }
+            }
             else if (button == &add)
             {
-                chooser = std::make_unique<juce::FileChooser>("Add VST3 search folder", juce::File(), "*");
+                chooser = std::make_unique<juce::FileChooser>("Add VST3 scan folder", juce::File(), "*");
                 auto safe = juce::Component::SafePointer<FolderManagerComponent>(this);
                 chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
                     [safe](const juce::FileChooser& selected)
                     {
-                        if (safe == nullptr) return;
-                        const auto folder = selected.getResult();
-                        if (!folder.isDirectory()) return;
+                        if (safe == nullptr || !selected.getResult().isDirectory()) return;
                         const auto paths = VST3HostEngine::getInstance().getRuntimePaths();
-                        const auto canonical = bridge::canonicalPath(folder);
-                        for (const auto& existing : safe->settings.scanFolders)
-                            if (bridge::canonicalPath(existing.location.resolve(paths)).equalsIgnoreCase(canonical)) return;
-                        safe->settings.scanFolders.add({ bridge::PathReference::fromFile(folder, paths), true, true });
-                        safe->commit(); safe->refresh();
+                        safe->settings.scanFolders.add({ bridge::PathReference::fromFile(selected.getResult(), paths), true, true });
+                        VST3HostEngine::getInstance().updateSettings(safe->settings);
+                        safe->refresh();
                     });
             }
         }
 
-        juce::Label title;
         juce::ListBox list;
-        juce::ToggleButton enabled, recursive;
-        juce::TextButton add, remove, open, rescan, scanAll, cancel;
+        juce::TextButton add, remove, scan, cancel;
         bridge::BridgeSettings settings;
         std::unique_ptr<juce::FileChooser> chooser;
     };
 
-    class SettingsComponent final : public juce::Component, private juce::Button::Listener, private juce::ComboBox::Listener
+    class SettingsComponent final : public juce::Component,
+                                    private juce::Button::Listener,
+                                    private juce::ComboBox::Listener
     {
     public:
-        SettingsComponent()
+        explicit SettingsComponent(std::function<void()> forgetCallbackIn)
+            : forgetCallback(std::move(forgetCallbackIn))
         {
             settings = VST3HostEngine::getInstance().getSettingsSnapshot();
             storage.addItemList({ "Automatic", "Portable", "User profile" }, 1);
-            startup.addItemList({ "Restore last active plugin", "Start with no plugin" }, 1);
-            storage.setSelectedId(settings.requestedStorageMode == bridge::StorageMode::portable ? 2 : settings.requestedStorageMode == bridge::StorageMode::userProfile ? 3 : 1);
+            startup.addItemList({ "Restore rack", "Start with empty rack" }, 1);
+            storage.setSelectedId(settings.requestedStorageMode == bridge::StorageMode::portable ? 2
+                : settings.requestedStorageMode == bridge::StorageMode::userProfile ? 3 : 1);
             startup.setSelectedId(settings.startupMode == "none" ? 2 : 1);
             storage.addListener(this); startup.addListener(this);
-            configure(scanBridge, "Scan bridge package folder", settings.scanBridgeFolder);
-            configure(scanSystem, "Scan standard system VST3 folders", settings.scanSystemFolders);
-            configure(removeMissing, "Remove missing plugins automatically", settings.removeMissing);
-            configure(retryQuarantine, "Retry quarantined plugins automatically", settings.retryQuarantined);
-            configure(autoEditor, "Open VST3 editor automatically when DSP starts", settings.openEditorOnStart);
-            configure(rememberWindow, "Remember window position and size", settings.rememberWindow);
-            openLog.setButtonText("Open Log"); openLogFolder.setButtonText("Open Log Folder"); openConfigFolder.setButtonText("Open Config Folder"); copyDiagnostics.setButtonText("Copy Diagnostics"); resetCache.setButtonText("Reset Scan Cache"); forgetAll.setButtonText("Forget All Plugins");
-            openLog.setTooltip("Open the current diagnostic log in its associated text editor.");
-            openLogFolder.setTooltip("Open the Windows Temp folder containing the bridge diagnostic log.");
-            openConfigFolder.setTooltip("Open the folder containing the active JSON configuration file. The location follows the selected Automatic, Portable or User profile storage mode.");
-            copyDiagnostics.setTooltip("Copy bridge version, architecture, DPI, paths, window state and plugin diagnostics to the clipboard.");
-            resetCache.setTooltip("Invalidate cached scan fingerprints and clear scan/runtime quarantine flags. Remembered plugins, their saved states and scan folders are kept; no scan starts automatically.");
-            forgetAll.setTooltip("Remove all plugins and their saved VST3 states from the dropdown. Scan folders and bridge settings are kept.");
-            scanBridge.setTooltip("Include the bridge package folder and its portable VST3 directory when you manually scan folders.");
-            scanSystem.setTooltip("Include the standard Windows Common Files VST3 locations when you manually start a scan.");
-            removeMissing.setTooltip("Remove dropdown entries whose VST3 bundle no longer exists when scan results are refreshed.");
-            retryQuarantine.setTooltip("Let a manual scan retry plugins previously isolated after a scan or runtime failure.");
-            autoEditor.setTooltip("Ask the out-of-process host to show the bridge window when AIMP starts this DSP. If startup recovery fails, it opens safely in bypass.");
-            rememberWindow.setTooltip("Restore bridge position, dimensions, monitor, DPI, visualizer/fullscreen state and always-on-top preference. Switching plugins does not force a new bridge size.");
-            for (auto* button : { &openLog, &openLogFolder, &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll }) { button->addListener(this); addAndMakeVisible(button); }
-            timeout.setRange(1, 120, 1); timeout.setValue(settings.scanTimeoutSeconds); timeout.setTextValueSuffix(" seconds scan timeout");
-            for (auto* c : std::initializer_list<juce::Component*> { &storageLabel, &storage, &startupLabel, &startup, &timeout }) addAndMakeVisible(c);
+            storage.setTooltip("Choose where this rack stores its independent configuration and VST3 states.");
+            startup.setTooltip("Restore the saved rack on startup or begin with an empty rack.");
             storageLabel.setText("Configuration storage", juce::dontSendNotification);
-            startupLabel.setText("Startup plugin", juce::dontSendNotification);
-            storageLabel.setTooltip("Where the bridge configuration, plugin list and per-plugin VST3 states are stored.");
-            storage.setTooltip("Automatic chooses a writable portable location when possible, otherwise the user profile. Portable stays with the bridge; User profile stays in Windows AppData.");
-            startupLabel.setTooltip("Choose whether AIMP restores the last active VST3 or starts the bridge in bypass.");
-            startup.setTooltip("Restore last active plugin reloads its saved VST3 state. Start with no plugin always opens in bypass; you can select a plugin later.");
-            storage.setColour(juce::ComboBox::backgroundColourId, juce::Colour(panel));
-            startup.setColour(juce::ComboBox::backgroundColourId, juce::Colour(panel));
-            storageLabel.setColour(juce::Label::textColourId, juce::Colours::white);
-            startupLabel.setColour(juce::Label::textColourId, juce::Colours::white);
-            configureHeading(discoveryTitle, "Discovery and safety");
-            configureHeading(windowTitle, "Window and startup");
-            configureHeading(maintenanceTitle, "Maintenance and diagnostics");
-            timeoutLabel.setText("Per-plugin scan timeout", juce::dontSendNotification);
-            timeoutHelp.setText("Maximum time allowed for one isolated scanner process\nbefore it is stopped and marked as timed out.", juce::dontSendNotification);
-            timeout.setTextValueSuffix(" s");
-            timeout.setTooltip("Maximum seconds allowed for each isolated scanner process. Increase it only for plugins that initialise slowly; a timeout keeps a frozen scanner from blocking AIMP.");
-            timeoutLabel.setTooltip(timeout.getTooltip());
-            timeoutHelp.setTooltip(timeout.getTooltip());
-            timeout.setSliderStyle(juce::Slider::LinearHorizontal);
-            timeout.setTextBoxStyle(juce::Slider::TextBoxRight, false, 84, 30);
-            for (auto* label : { &timeoutLabel, &timeoutHelp })
-            {
-                label->setColour(juce::Label::textColourId, label == &timeoutHelp ? juce::Colours::lightgrey : juce::Colours::white);
-                label->setJustificationType(juce::Justification::centredLeft);
-                addAndMakeVisible(label);
-            }
-            timeout.onDragEnd = [this] { commit(); };
-            setSize(980, 620);
+            startupLabel.setText("Rack startup", juce::dontSendNotification);
+            storageLabel.setTooltip(storage.getTooltip()); startupLabel.setTooltip(startup.getTooltip());
+            configure(scanBridge, "Include rack folder when scanning", settings.scanBridgeFolder,
+                      "Include the installed rack folder and its VST3 subfolder in Scan All.");
+            configure(scanSystem, "Include system VST3 folders", settings.scanSystemFolders,
+                      "Include the standard Windows VST3 folders in Scan All.");
+            configure(openWithAimp, "Open rack window with AIMP", settings.openRackOnStartup,
+                      "Show the rack window automatically when AIMP starts this DSP.");
+            openLog.setButtonText("Open Log"); openConfig.setButtonText("Open Config Folder");
+            diagnostics.setButtonText("Copy Diagnostics"); resetCache.setButtonText("Reset Scan Cache");
+            forgetAll.setButtonText("Forget All Plugins");
+            openLog.setTooltip("Open the current VST3 Bridge Rack For AIMP diagnostic log.");
+            openConfig.setTooltip("Open the folder containing this rack's independent configuration.");
+            diagnostics.setTooltip("Copy rack, architecture, paths and plug-in diagnostics to the clipboard.");
+            resetCache.setTooltip("Clear scan fingerprints and quarantines while keeping the rack and saved states.");
+            forgetAll.setTooltip("Clear the rack and forget every scanned VST3 entry. Plug-in files are not deleted.");
+            for (auto* component : std::initializer_list<juce::Component*> { &storageLabel, &storage, &startupLabel, &startup,
+                     &scanBridge, &scanSystem, &openWithAimp, &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll }) addAndMakeVisible(component);
+            for (auto* button : { &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll }) button->addListener(this);
+            setSize(720, 365);
         }
         ~SettingsComponent() override { commit(); }
         void paint(juce::Graphics& g) override { g.fillAll(juce::Colour(background)); }
         void resized() override
         {
             auto area = getLocalBounds().reduced(24);
-            auto row = area.removeFromTop(36);
-            storageLabel.setBounds(row.removeFromLeft(190));
-            storage.setBounds(row);
-            area.removeFromTop(10);
-            row = area.removeFromTop(36);
-            startupLabel.setBounds(row.removeFromLeft(190));
-            startup.setBounds(row);
-            area.removeFromTop(18);
-
-            auto maintenance = area.removeFromBottom(82);
-            auto columns = area;
-            const auto columnWidth = (columns.getWidth() - 24) / 2;
-            auto left = columns.removeFromLeft(columnWidth);
-            columns.removeFromLeft(24);
-            auto right = columns;
-
-            discoveryTitle.setBounds(left.removeFromTop(30));
-            left.removeFromTop(4);
-            for (auto* c : { &scanBridge, &scanSystem, &removeMissing, &retryQuarantine })
-                c->setBounds(left.removeFromTop(34));
-            left.removeFromTop(8);
-            timeoutLabel.setBounds(left.removeFromTop(24));
-            timeout.setBounds(left.removeFromTop(36));
-            timeoutHelp.setBounds(left.removeFromTop(48));
-
-            windowTitle.setBounds(right.removeFromTop(30));
-            right.removeFromTop(4);
-            for (auto* c : { &autoEditor, &rememberWindow })
-                c->setBounds(right.removeFromTop(34));
-
-            maintenanceTitle.setBounds(maintenance.removeFromTop(28));
-            maintenance.removeFromTop(6);
-            juce::FlexBox buttons;
-            buttons.flexDirection = juce::FlexBox::Direction::row;
-            buttons.justifyContent = juce::FlexBox::JustifyContent::spaceBetween;
-            for (auto* button : { &openLog, &openLogFolder, &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll })
-                buttons.items.add(juce::FlexItem(*button).withMinWidth(145.0f).withHeight(36.0f));
-            buttons.performLayout(maintenance.toFloat());
+            auto row = area.removeFromTop(36); storageLabel.setBounds(row.removeFromLeft(190)); storage.setBounds(row);
+            area.removeFromTop(10); row = area.removeFromTop(36); startupLabel.setBounds(row.removeFromLeft(190)); startup.setBounds(row);
+            area.removeFromTop(18); scanBridge.setBounds(area.removeFromTop(34)); scanSystem.setBounds(area.removeFromTop(34));
+            openWithAimp.setBounds(area.removeFromTop(34));
+            area.removeFromTop(20); row = area.removeFromTop(38);
+            const auto buttonWidth = row.getWidth() / 5;
+            for (auto* button : { &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll })
+                button->setBounds(row.removeFromLeft(buttonWidth).reduced(3));
         }
     private:
-        void configure(juce::ToggleButton& button, const juce::String& text, bool value)
-        { button.setButtonText(text); button.setToggleState(value, juce::dontSendNotification); button.addListener(this); addAndMakeVisible(button); }
-        void configureHeading(juce::Label& label, const juce::String& text)
-        {
-            label.setText(text, juce::dontSendNotification);
-            label.setFont(juce::FontOptions(17.0f));
-            label.setTooltip(text + " settings");
-            label.setColour(juce::Label::textColourId, juce::Colour(0xff76d7c4));
-            addAndMakeVisible(label);
-        }
+        void configure(juce::ToggleButton& button, const juce::String& text, bool value, const juce::String& tooltip)
+        { button.setButtonText(text); button.setToggleState(value, juce::dontSendNotification); button.setTooltip(tooltip); button.addListener(this); }
+        void comboBoxChanged(juce::ComboBox*) override { commit(); }
         void buttonClicked(juce::Button* button) override
         {
             auto& engine = VST3HostEngine::getInstance();
             if (button == &openLog) engine.getLogFile().startAsProcess();
-            else if (button == &openLogFolder) engine.getLogFile().getParentDirectory().startAsProcess();
-            else if (button == &openConfigFolder) engine.getConfigFile().getParentDirectory().startAsProcess();
-            else if (button == &copyDiagnostics) juce::SystemClipboard::copyTextToClipboard(engine.getDiagnostics());
-            else if (button == &resetCache) { engine.resetScanCache(); settings = engine.getSettingsSnapshot(); }
-            else if (button == &forgetAll) { engine.forgetAllPlugins(); settings = engine.getSettingsSnapshot(); }
+            else if (button == &openConfig) engine.getConfigFile().getParentDirectory().startAsProcess();
+            else if (button == &diagnostics) juce::SystemClipboard::copyTextToClipboard(engine.getDiagnostics());
+            else if (button == &resetCache) engine.resetScanCache();
+            else if (button == &forgetAll)
+            {
+                if (forgetCallback) forgetCallback();
+                settings = engine.getSettingsSnapshot();
+            }
             else commit();
         }
-        void comboBoxChanged(juce::ComboBox*) override { commit(); }
         void commit()
         {
-            settings.requestedStorageMode = storage.getSelectedId() == 2 ? bridge::StorageMode::portable : storage.getSelectedId() == 3 ? bridge::StorageMode::userProfile : bridge::StorageMode::automatic;
+            settings.requestedStorageMode = storage.getSelectedId() == 2 ? bridge::StorageMode::portable
+                : storage.getSelectedId() == 3 ? bridge::StorageMode::userProfile : bridge::StorageMode::automatic;
             settings.startupMode = startup.getSelectedId() == 2 ? "none" : "restoreLast";
-            settings.scanOnStartup = false; settings.removeMissing = removeMissing.getToggleState();
-            settings.scanBridgeFolder = scanBridge.getToggleState(); settings.scanSystemFolders = scanSystem.getToggleState();
-            settings.retryQuarantined = retryQuarantine.getToggleState(); settings.openEditorOnStart = autoEditor.getToggleState();
-            settings.rememberWindow = rememberWindow.getToggleState();
-            settings.scanTimeoutSeconds = static_cast<int>(timeout.getValue());
+            settings.openRackOnStartup = openWithAimp.getToggleState();
+            settings.scanBridgeFolder = scanBridge.getToggleState();
+            settings.scanSystemFolders = scanSystem.getToggleState();
             VST3HostEngine::getInstance().updateSettings(settings);
         }
         bridge::BridgeSettings settings;
-        juce::Label storageLabel, startupLabel, discoveryTitle, windowTitle, maintenanceTitle, timeoutLabel, timeoutHelp;
+        juce::Label storageLabel, startupLabel;
         juce::ComboBox storage, startup;
-        juce::ToggleButton scanBridge, scanSystem, removeMissing, retryQuarantine, autoEditor, rememberWindow;
-        juce::TextButton openLog, openLogFolder, openConfigFolder, copyDiagnostics, resetCache, forgetAll;
-        juce::Slider timeout;
+        juce::ToggleButton scanBridge, scanSystem, openWithAimp;
+        juce::TextButton openLog, openConfig, diagnostics, resetCache, forgetAll;
+        std::function<void()> forgetCallback;
     };
 }
 
+class DetachedEditorWindow final : public juce::DocumentWindow, private juce::KeyListener, private juce::Timer
+{
+    class EditorBackdrop final : public juce::Component
+    {
+    public:
+        void attach(juce::AudioProcessorEditor& editorIn, juce::Colour colourIn)
+        {
+            editor = &editorIn;
+            colour = colourIn;
+            naturalSize = { editor->getWidth(), editor->getHeight() };
+            growable = editor->isResizable();
+            if (growable)
+                if (auto* sizeConstrainer = editor->getConstrainer())
+                {
+                    auto candidate = juce::Rectangle<int>(0, 0, naturalSize.x + 256, naturalSize.y + 256);
+                    sizeConstrainer->checkBounds(candidate, editor->getBounds(), { 0, 0, 8192, 8192 },
+                                                 false, false, true, true);
+                    growable = candidate.getWidth() > naturalSize.x || candidate.getHeight() > naturalSize.y;
+                }
+            setSize(naturalSize.x, naturalSize.y);
+            setOpaque(true);
+            addAndMakeVisible(editor);
+        }
+        void paint(juce::Graphics& g) override { g.fillAll(colour); }
+        void resized() override
+        {
+            if (editor == nullptr) return;
+            auto target = getLocalBounds();
+            if (!growable)
+                target = target.withSizeKeepingCentre(naturalSize.x, naturalSize.y);
+            editor->setBounds(target);
+        }
+        void syncEditorSize()
+        {
+            if (editor == nullptr) return;
+            const juce::Point<int> current { editor->getWidth(), editor->getHeight() };
+            if (!growable && current.x > 0 && current.y > 0 && current != naturalSize)
+            {
+                naturalSize = current;
+                resized();
+            }
+        }
+        bool isGrowable() const { return growable; }
+        juce::Point<int> getNaturalSize() const { return naturalSize; }
+    private:
+        juce::AudioProcessorEditor* editor = nullptr;
+        juce::Point<int> naturalSize;
+        juce::Colour colour;
+        bool growable = false;
+    };
+
+public:
+    DetachedEditorWindow(int slot, bool fullScreen, juce::Rectangle<int> sourceBounds)
+        : DocumentWindow(pluginName(slot), fullScreen ? juce::Colour(0xff1e1e1e) : juce::Colour(surface),
+                         DocumentWindow::closeButton)
+    {
+        lookAndFeel.setColourScheme(juce::LookAndFeel_V4::getDarkColourScheme());
+        setLookAndFeel(&lookAndFeel);
+        setUsingNativeTitleBar(false);
+        setTitleBarHeight(fullScreen ? 0 : 30);
+        setTitleBarTextCentred(true);
+        setColour(DocumentWindow::textColourId, juce::Colours::white);
+        setTitleBarButtonsRequired(DocumentWindow::closeButton, false);
+        if (auto* processor = VST3HostEngine::getInstance().getRackPluginInstance(slot))
+            editor.reset(processor->createEditorAndMakeActive());
+        if (editor != nullptr)
+        {
+            const auto backdropColour = fullScreen ? juce::Colour(0xff1e1e1e) : juce::Colour(surface);
+            editor->setColour(juce::ResizableWindow::backgroundColourId, backdropColour);
+            editor->addKeyListener(this);
+            backdrop.attach(*editor, backdropColour);
+            usesBackdrop = fullScreen || backdrop.isGrowable();
+            setContentNonOwned(usesBackdrop ? static_cast<juce::Component*>(&backdrop)
+                                            : static_cast<juce::Component*>(editor.get()), true);
+            if (fullScreen || !backdrop.isGrowable())
+                setResizable(false, false);
+            else
+            {
+                setResizable(backdrop.isGrowable(), true);
+                setResizeLimits(1, 1, 8192, 8192);
+            }
+        }
+        addKeyListener(this);
+        const auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect(sourceBounds);
+        if (display != nullptr)
+        {
+            const auto available = display->userBounds.toNearestInt();
+            if (!fullScreen && editor != nullptr && backdrop.isGrowable())
+            {
+                const auto physical = bridge::comfortableWindowPhysicalSize(
+                    { display->physicalBounds.getWidth(), display->physicalBounds.getHeight() });
+                const auto scale = juce::jmax(0.25, display->scale);
+                const auto minimumWidth = juce::jmin(1050, available.getWidth());
+                const auto minimumHeight = juce::jmin(520, available.getHeight());
+                const auto width = juce::jlimit(minimumWidth, available.getWidth(),
+                                                 juce::roundToInt(physical[0] / scale));
+                const auto height = juce::jlimit(minimumHeight, available.getHeight(),
+                                                  juce::roundToInt(physical[1] / scale));
+                setBounds(available.withSizeKeepingCentre(width, height));
+            }
+            else if (!fullScreen && editor != nullptr)
+            {
+                const auto natural = backdrop.getNaturalSize();
+                setBounds(available.withSizeKeepingCentre(natural.x, natural.y + getTitleBarHeight()));
+            }
+            else
+                setBounds(available.withSizeKeepingCentre(getWidth(), getHeight()));
+        }
+        else
+        {
+            const auto natural = backdrop.getNaturalSize();
+            centreWithSize(!fullScreen && !usesBackdrop ? natural.x : getWidth(),
+                           !fullScreen && !usesBackdrop ? natural.y + getTitleBarHeight() : getHeight());
+        }
+        setVisible(true);
+        toFront(true);
+        if (fullScreen) juce::Desktop::getInstance().setKioskModeComponent(this, false);
+        startTimer(35);
+    }
+
+    ~DetachedEditorWindow() override
+    {
+        if (juce::Desktop::getInstance().getKioskModeComponent() == this)
+            juce::Desktop::getInstance().setKioskModeComponent(nullptr);
+        if (editor != nullptr) editor->removeKeyListener(this);
+        clearContentComponent();
+        setLookAndFeel(nullptr);
+    }
+
+    void closeButtonPressed() override { exitMode(); }
+    bool keyPressed(const juce::KeyPress& key) override { return handleKey(key); }
+
+private:
+    static juce::String pluginName(int slot)
+    {
+        if (auto* plugin = VST3HostEngine::getInstance().getRackPluginInstance(slot)) return plugin->getName();
+        return "VST3";
+    }
+
+    bool keyPressed(const juce::KeyPress& key, juce::Component*) override { return handleKey(key); }
+    void timerCallback() override
+    {
+        if (usesBackdrop)
+        {
+            backdrop.syncEditorSize();
+            backdrop.resized();
+        }
+        if (!isActiveWindow()) return;
+        const auto down = juce::KeyPress::isKeyCurrentlyDown(juce::KeyPress::escapeKey)
+                       || juce::KeyPress::isKeyCurrentlyDown(juce::KeyPress::F11Key);
+        if (!shortcutArmed) { shortcutArmed = !down; return; }
+        if (down) exitMode();
+    }
+    bool handleKey(const juce::KeyPress& key)
+    {
+        if (key.getKeyCode() != juce::KeyPress::escapeKey && key.getKeyCode() != juce::KeyPress::F11Key) return false;
+        exitMode();
+        return true;
+    }
+    void exitMode()
+    {
+        if (closing) return;
+        closing = true;
+        stopTimer();
+        if (juce::Desktop::getInstance().getKioskModeComponent() == this)
+            juce::Desktop::getInstance().setKioskModeComponent(nullptr);
+        setVisible(false);
+    }
+
+    juce::LookAndFeel_V4 lookAndFeel;
+    EditorBackdrop backdrop;
+    std::unique_ptr<juce::AudioProcessorEditor> editor;
+    bool usesBackdrop = false;
+    bool closing = false;
+    bool shortcutArmed = false;
+};
+
+class RackCardComponent final : public juce::Component,
+                                private juce::Button::Listener,
+                                private juce::KeyListener,
+                                private juce::Timer
+{
+public:
+    RackCardComponent(HostContentComponent& ownerIn, int indexIn, bool expandedIn, bool activeIn)
+        : owner(ownerIn), index(indexIn), active(activeIn)
+    {
+        auto& engine = VST3HostEngine::getInstance();
+        const auto paths = engine.getRackPluginPaths();
+        const auto path = juce::isPositiveAndBelow(index, paths.size()) ? paths[index] : juce::String();
+        auto* processor = engine.getRackPluginInstance(index);
+        juce::String company = "Unknown company", category = "Unclassified";
+        const auto canonical = bridge::canonicalPath(bridge::vst3BundleRoot(juce::File(path)));
+        for (const auto& record : engine.getPluginRecords())
+            if (record.canonicalPath.equalsIgnoreCase(canonical))
+            {
+                if (record.manufacturer.isNotEmpty()) company = record.manufacturer;
+                if (record.category.isNotEmpty()) category = record.category;
+                break;
+            }
+        number.setText(juce::String(index + 1).paddedLeft('0', 2), juce::dontSendNotification);
+        name.setText(processor != nullptr ? processor->getName() : juce::File(path).getFileNameWithoutExtension(), juce::dontSendNotification);
+        info.setText(company + "  |  " + category + "  |  " + path, juce::dontSendNotification);
+        number.setTooltip("Rack position " + juce::String(index + 1) + ". Drag this card to reorder the chain.");
+        name.setTooltip("VST3 in rack slot " + juce::String(index + 1) + ": " + path);
+        info.setTooltip("Company: " + company + " | Class: " + category + " | VST3 bundle: " + path);
+        number.setInterceptsMouseClicks(false, false); name.setInterceptsMouseClicks(false, false); info.setInterceptsMouseClicks(false, false);
+        name.setFont(juce::FontOptions(18.0f).withStyle("Bold"));
+        number.setFont(juce::FontOptions(17.0f));
+        info.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+
+        configure(expand, expandedIn ? "^" : "v",
+                  "Show or hide this VST3 GUI inside its rack card.");
+        configure(mute, "M", "Mute this slot so audio skips this VST3.");
+        configure(solo, "S", "Solo this slot so audio skips every non-solo rack slot.");
+        configure(up, "^", "Move this card one position up.");
+        configure(down, "v", "Move this card one position down.");
+        configure(add, "+", "Open the VST3 menu and insert a new slot below this card.");
+        configure(remove, "-", "Remove this slot from the rack.");
+        configure(clone, "Clone", "Clone this VST3, including its state, above or below this card.");
+        configure(replace, "Replace...", "Replace this card with a scanned VST3 or choose Add VST to scan one file.");
+        configure(actions, "Actions...", "Reload, reset or forget this VST3, reveal its file, or open Detached/Full Screen mode.");
+        mute.setClickingTogglesState(true); solo.setClickingTogglesState(true);
+        mute.setToggleState(engine.isRackSlotMuted(index), juce::dontSendNotification);
+        solo.setToggleState(engine.isRackSlotSolo(index), juce::dontSendNotification);
+        setExpanded(expandedIn);
+        setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+    }
+
+    ~RackCardComponent() override { stopTimer(); clearEditor(); }
+
+    int preferredHeight() const { return cardHeaderHeight + (editor != nullptr ? editorHeight + 28 : 0); }
+
+    void paint(juce::Graphics& g) override
+    {
+        auto bounds = getLocalBounds().toFloat().reduced(1.0f);
+        g.setColour(juce::Colour(active ? activeSurface : surfaceRaised)); g.fillRoundedRectangle(bounds, 10.0f);
+        g.setColour(solo.getToggleState() ? juce::Colour(soloColour)
+                    : mute.getToggleState() ? juce::Colour(mutedColour) : juce::Colour(0xff686868));
+        g.drawRoundedRectangle(bounds, 10.0f, 1.5f);
+        g.setColour(juce::Colour(accent));
+        g.fillRoundedRectangle(juce::Rectangle<float>(8.0f, 15.0f, 4.0f, 62.0f), 2.0f);
+        if (dropEdge != 0)
+        {
+            g.setColour(juce::Colour(accent));
+            const auto y = dropEdge < 0 ? 1.0f : static_cast<float>(getHeight() - 5);
+            g.fillRoundedRectangle(16.0f, y, static_cast<float>(getWidth() - 32), 4.0f, 2.0f);
+        }
+    }
+
+    void resized() override
+    {
+        auto header = getLocalBounds().removeFromTop(cardHeaderHeight).reduced(14, 10);
+        number.setBounds(header.removeFromLeft(38));
+        const auto identityWidth = juce::jlimit(180, 380,
+            juce::GlyphArrangement::getStringWidthInt(name.getFont(), name.getText()) + 32);
+        auto identity = header.removeFromLeft(identityWidth);
+        name.setBounds(identity.removeFromTop(38));
+        expand.setBounds(identity.removeFromLeft(38).reduced(3));
+        mute.setBounds(header.removeFromLeft(50).reduced(2));
+        solo.setBounds(header.removeFromLeft(50).reduced(2));
+        header.removeFromLeft(12);
+        auto actionArea = header.removeFromRight(520);
+        for (auto* button : { &up, &down, &add, &remove }) button->setBounds(actionArea.removeFromLeft(48).reduced(2));
+        clone.setBounds(actionArea.removeFromLeft(84).reduced(2));
+        replace.setBounds(actionArea.removeFromLeft(116).reduced(2));
+        actions.setBounds(actionArea.reduced(2));
+        info.setBounds(header.reduced(4, 2));
+        if (editor != nullptr)
+        {
+            auto editorArea = getLocalBounds().withTrimmedTop(cardHeaderHeight).reduced(12, 6);
+            resizeHandle.setBounds(editorArea.removeFromBottom(16));
+            if (editorResizable) editor->setBounds(editorArea);
+            else editor->setBounds(editorArea.withSizeKeepingCentre(naturalEditorWidth, naturalEditorHeight));
+        }
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override
+    { owner.activateSlot(index); dragOrigin = event.getPosition(); dragging = false; }
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        if (!dragging && event.getDistanceFromDragStart() > 6)
+        {
+            dragging = true;
+            owner.startDragging(juce::var(index), this);
+        }
+    }
+
+    void setDropIndicator(int edge) { if (dropEdge != edge) { dropEdge = edge; repaint(); } }
+    void setActive(bool shouldBeActive)
+    {
+        if (active == shouldBeActive) return;
+        active = shouldBeActive;
+        updateEditorBackground();
+        repaint();
+    }
+
+private:
+    void configure(juce::TextButton& button, const juce::String& text, const juce::String& tooltip)
+    { button.setButtonText(text); button.setTooltip(tooltip); button.addListener(this); addAndMakeVisible(button); }
+    void clearEditor()
+    {
+        if (editor != nullptr) { editor->removeKeyListener(this); removeChildComponent(editor.get()); editor.reset(); }
+    }
+    void updateEditorBackground()
+    {
+        if (editor == nullptr) return;
+        editor->setColour(juce::ResizableWindow::backgroundColourId,
+                          juce::Colour(active ? activeSurface : surfaceRaised));
+        editor->repaint();
+    }
+    void setExpanded(bool shouldExpand)
+    {
+        clearEditor();
+        for (auto* component : std::initializer_list<juce::Component*> { &number, &name, &info }) addAndMakeVisible(component);
+        if (!shouldExpand) return;
+        auto& engine = VST3HostEngine::getInstance();
+        engine.selectRackSlot(index); engine.applyPendingPluginState();
+        auto* processor = engine.getRackPluginInstance(index);
+        if (processor == nullptr || !processor->hasEditor()) return;
+        editor.reset(processor->createEditorAndMakeActive());
+        if (editor != nullptr)
+        {
+            naturalEditorWidth = editor->getWidth();
+            naturalEditorHeight = editor->getHeight();
+            editorResizable = editor->isResizable();
+            safeMinimumEditorHeight = naturalEditorHeight;
+            if (editorResizable)
+                if (auto* constrainer = editor->getConstrainer())
+                {
+                    auto candidate = juce::Rectangle<int>(0, 0, naturalEditorWidth, 1);
+                    constrainer->checkBounds(candidate, editor->getBounds(), { 0, 0, 4096, 4096 },
+                                             false, false, true, false);
+                    const auto reportedMinimum = juce::jmax(constrainer->getMinimumHeight(), candidate.getHeight());
+                    if (reportedMinimum >= 120) safeMinimumEditorHeight = reportedMinimum;
+                }
+            safeMinimumEditorHeight = juce::jlimit(120, 2400, safeMinimumEditorHeight);
+            const auto cachedHeight = engine.getRackSlotEditorHeight(index);
+            editorHeight = juce::jlimit(safeMinimumEditorHeight, 2400,
+                cachedHeight > 0 ? cachedHeight : naturalEditorHeight);
+            if (cachedHeight != editorHeight) engine.setRackSlotEditorHeight(index, editorHeight);
+            resizeHandle.setMinimumHeight(safeMinimumEditorHeight);
+            editor->addKeyListener(this);
+            updateEditorBackground();
+            addAndMakeVisible(editor.get());
+            addAndMakeVisible(resizeHandle);
+            pendingEditorRelayouts = 3;
+            startTimer(300);
+        }
+    }
+    void timerCallback() override
+    {
+        if (editor != nullptr && pendingEditorRelayouts > 0)
+        {
+            --pendingEditorRelayouts;
+            resized();
+            editor->repaint();
+            return;
+        }
+        if (editorResizable && editor != nullptr && editor->getHeight() != editorHeight)
+        {
+            editorHeight = juce::jlimit(safeMinimumEditorHeight, 2400, editor->getHeight());
+            VST3HostEngine::getInstance().setRackSlotEditorHeight(index, editorHeight);
+            owner.resized();
+        }
+    }
+    bool keyPressed(const juce::KeyPress& key, juce::Component*) override
+    {
+        if (key.getKeyCode() == juce::KeyPress::F11Key)
+        {
+            auto safeOwner = juce::Component::SafePointer<HostContentComponent>(&owner);
+            const auto slot = index;
+            juce::MessageManager::callAsync([safeOwner, slot]
+            { if (safeOwner != nullptr) safeOwner->openDetachedSlot(slot, true); });
+            return true;
+        }
+        if (key.getKeyCode() == juce::KeyPress::leftKey || key.getKeyCode() == juce::KeyPress::upKey)
+        { owner.selectAdjacentGui(-1); return true; }
+        if (key.getKeyCode() == juce::KeyPress::rightKey || key.getKeyCode() == juce::KeyPress::downKey)
+        { owner.selectAdjacentGui(1); return true; }
+        return false;
+    }
+    void buttonClicked(juce::Button* button) override
+    {
+        owner.activateSlot(index);
+        if (button == &expand) owner.toggleSlotEditor(index);
+        else if (button == &mute) owner.setSlotMuted(index, mute.getToggleState());
+        else if (button == &solo) owner.setSlotSolo(index, solo.getToggleState());
+        else if (button == &up) owner.moveSlot(index, index - 1);
+        else if (button == &down) owner.moveSlot(index, index + 1);
+        else if (button == &add) owner.showAddMenu(index + 1);
+        else if (button == &remove) owner.removeSlot(index);
+        else if (button == &clone)
+        {
+            juce::PopupMenu menu; menu.addItem(1, "Clone above"); menu.addItem(2, "Clone below");
+            auto safe = juce::Component::SafePointer<RackCardComponent>(this);
+            menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&clone), [safe](int result)
+            { if (safe != nullptr && result > 0) safe->owner.cloneSlot(safe->index, result == 1); });
+        }
+        else if (button == &replace) owner.showReplaceMenu(index);
+        else if (button == &actions)
+        {
+            juce::PopupMenu menu;
+            menu.addItem(1, "Reset plugin parameters");
+            menu.addItem(6, "Reload plugin");
+            menu.addItem(2, "Open plugin location");
+            menu.addSeparator();
+            menu.addItem(3, "Detached mode");
+            menu.addItem(4, "Full Screen (F11)");
+            menu.addSeparator();
+            menu.addItem(5, "Forget current plugin");
+            auto safe = juce::Component::SafePointer<RackCardComponent>(this);
+            menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&actions), [safe](int result)
+            {
+                if (safe == nullptr) return;
+                if (result == 1) safe->owner.resetSlotParameters(safe->index);
+                else if (result == 6)
+                {
+                    auto safeOwner = juce::Component::SafePointer<HostContentComponent>(&safe->owner);
+                    const auto slot = safe->index;
+                    juce::MessageManager::callAsync([safeOwner, slot]
+                    { if (safeOwner != nullptr) safeOwner->reloadSlot(slot); });
+                }
+                else if (result == 2) safe->owner.openSlotLocation(safe->index);
+                else if (result == 3) safe->owner.openDetachedSlot(safe->index, false);
+                else if (result == 4) safe->owner.openDetachedSlot(safe->index, true);
+                else if (result == 5) safe->owner.forgetPlugin(safe->index);
+            });
+        }
+    }
+
+    class EditorResizeHandle final : public juce::Component, public juce::SettableTooltipClient
+    {
+    public:
+        explicit EditorResizeHandle(RackCardComponent& cardIn) : card(cardIn)
+        { setMouseCursor(juce::MouseCursor::UpDownResizeCursor); }
+        void setMinimumHeight(int minimum)
+        { setTooltip("Drag to resize this VST3 GUI. Safe minimum: " + juce::String(minimum) + " px."); }
+        void paint(juce::Graphics& g) override
+        {
+            g.setColour(juce::Colour(accent));
+            g.fillRoundedRectangle(getLocalBounds().toFloat().reduced(80.0f, 3.0f), 2.0f);
+        }
+        void mouseDown(const juce::MouseEvent&) override { startHeight = card.editorHeight; }
+        void mouseDrag(const juce::MouseEvent& event) override
+        {
+            card.editorHeight = juce::jlimit(card.safeMinimumEditorHeight, 2400,
+                                             startHeight + event.getDistanceFromDragStartY());
+            card.owner.resized();
+        }
+        void mouseUp(const juce::MouseEvent&) override
+        { VST3HostEngine::getInstance().setRackSlotEditorHeight(card.index, card.editorHeight); }
+    private:
+        RackCardComponent& card;
+        int startHeight = 0;
+    };
+
+    HostContentComponent& owner;
+    int index;
+    int editorHeight = 0;
+    int naturalEditorWidth = 0;
+    int naturalEditorHeight = 0;
+    int safeMinimumEditorHeight = 240;
+    int pendingEditorRelayouts = 0;
+    bool dragging = false;
+    bool active = false;
+    bool editorResizable = false;
+    int dropEdge = 0;
+    juce::Point<int> dragOrigin;
+    juce::Label number, name, info;
+    juce::TextButton expand, mute, solo, up, down, add, remove, clone, replace, actions;
+    EditorResizeHandle resizeHandle { *this };
+    std::unique_ptr<juce::AudioProcessorEditor> editor;
+};
+
+void RackCanvas::paint(juce::Graphics& g) { g.fillAll(juce::Colour(background)); }
+void RackViewport::paint(juce::Graphics& g) { g.fillAll(juce::Colour(background)); }
+
 HostContentComponent::HostContentComponent()
 {
-    VST3HostEngine::getInstance().writeLog("Bridge content construction started");
-    pluginLabel.setText("Active VST3 Plugin:", juce::dontSendNotification);
-    pluginLabel.setTooltip("The VST3 currently processing AIMP audio. Each remembered plugin keeps its own parameters, opaque VST3 state and GUI-scale state when the plugin serialises it.");
-    noEditorLabel.setText("Select a compatible VST3 plugin.", juce::dontSendNotification);
-    noEditorLabel.setTooltip("Choose a compatible plugin from the dropdown or use Load VST. Bypass passes audio through unchanged.");
-    noEditorLabel.setJustificationType(juce::Justification::centred);
-    for (auto* text : { &statusLabel, &detailLabel })
-    {
-        text->setReadOnly(true);
-        text->setMultiLine(false, false);
-        text->setScrollbarsShown(false);
-        text->setCaretVisible(false);
-        text->setPopupMenuEnabled(false);
-        text->setColour(juce::TextEditor::backgroundColourId, juce::Colour(panel));
-        text->setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
-    }
-    detailLabel.setColour(juce::TextEditor::textColourId, juce::Colours::lightgrey);
-    detailLabel.setTooltip("Full plugin name, company, version and normalised VST3 bundle location for the selected entry.");
-    statusLabel.setTooltip("Current scan, startup, loading or recovery status. Detailed diagnostics are also written to the bridge log.");
-    const auto startupWarning = VST3HostEngine::getInstance().getStartupWarning();
-    if (startupWarning.isNotEmpty())
-    {
-        statusLabel.setText(startupWarning, false);
-        noEditorLabel.setText(startupWarning, juce::dontSendNotification);
-    }
-    pluginComboBox.setColour(juce::ComboBox::backgroundColourId, juce::Colour(panel));
-    pluginComboBox.setTooltip("Switch the active VST3 or choose None - Bypass. The current plugin state is saved before switching and the selected plugin restores its own last state. The bridge window size is not reset automatically.");
-    pluginComboBox.addListener(this);
-    for (auto* component : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &foldersButton,
-                             &removeButton, &settingsButton, &alwaysOnTopButton,
-                             &visualizerButton, &fullscreenButton, &statusLabel, &detailLabel, &noEditorLabel })
-        addAndMakeVisible(component);
-    for (auto* button : { &loadButton, &foldersButton, &removeButton, &settingsButton,
-                          &alwaysOnTopButton, &visualizerButton, &fullscreenButton })
-        button->addListener(this);
-    loadButton.setTooltip("Choose one VST3 bundle, validate it in isolation, add it to the dropdown and load it.");
-    foldersButton.setTooltip("Manage manual search locations, then scan one selected folder or every enabled folder. No automatic scan runs at startup.");
-    removeButton.setTooltip("Open actions for the selected plugin. Reset Parameters recreates it without saved state, including non-parameter state such as loaded FIR data when supported. Reset Size changes only the bridge window using the current monitor resolution, aspect ratio and Windows DPI scale. You can also retry, forget, or open the folder containing the VST3 bundle.");
-    settingsButton.setTooltip("Open compact bridge settings for storage, startup recovery, manual discovery, window restoration and diagnostics.");
-    alwaysOnTopButton.setTooltip("Toggle whether the bridge stays above ordinary windows. This preference is saved. It does not force focus over modal dialogs.");
-    visualizerButton.setTooltip("Toggle Visualizer Mode: hide bridge controls and keep a minimal movable title bar. Press Escape to return to normal mode.");
-    fullscreenButton.setTooltip("Toggle true fullscreen visualizer mode. Shortcut: F11 enters or exits; Escape returns to the normal bordered window.");
-    updateWindowModeButtons();
-    addMouseListener(this, true);
-    VST3HostEngine::getInstance().writeLog("Bridge content controls created");
-    updatePluginList();
-    lastActivePath = VST3HostEngine::getInstance().getActivePluginPath();
-    VST3HostEngine::getInstance().writeLog("Bridge content plugin list populated");
-    startTimer(350);
-    editorInitialised = true;
-    VST3HostEngine::getInstance().writeLog("VST3 editor creation deferred until bridge is shown");
+    title.setText("VST3 Bridge Rack For AIMP", juce::dontSendNotification);
+    title.setFont(juce::FontOptions(23.0f).withStyle("Bold"));
+    title.setColour(juce::Label::textColourId, juce::Colour(accent));
+    title.setTooltip("Ordered VST3 processing rack. Audio flows from slot 01 downward.");
+    for (auto* button : { &addButton, &cardStatesButton, &foldersButton, &settingsButton }) { button->addListener(this); addAndMakeVisible(button); }
+    addButton.setTooltip("Open all scanned VST3 plug-ins or choose Add VST to scan one file, then append it to the rack.");
+    foldersButton.setTooltip("Manage VST3 search folders and run a scan.");
+    settingsButton.setTooltip("Open rack storage, startup, scan and diagnostic settings.");
+    cardStatesButton.setTooltip("Expand every card, collapse every card, or remove all rack cards.");
+    statusLabel.setReadOnly(true); statusLabel.setMultiLine(false, false); statusLabel.setScrollbarsShown(false);
+    statusLabel.setCaretVisible(false); statusLabel.setPopupMenuEnabled(false);
+    statusLabel.setColour(juce::TextEditor::backgroundColourId, juce::Colour(surface));
+    statusLabel.setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
+    statusLabel.setTooltip("Rack status, scanning progress and load errors.");
+    viewport.setViewedComponent(&rackContent, false);
+    viewport.setScrollBarsShown(true, false);
+    viewport.setScrollBarThickness(12);
+    viewport.getVerticalScrollBar().setColour(juce::ScrollBar::backgroundColourId, juce::Colour(background));
+    viewport.getVerticalScrollBar().setColour(juce::ScrollBar::trackColourId, juce::Colour(surface));
+    viewport.getVerticalScrollBar().setColour(juce::ScrollBar::thumbColourId, juce::Colour(accent));
+    viewport.setTooltip("Scroll vertically through the rack cards. Cards process audio from top to bottom.");
+    setOpaque(true); viewport.setOpaque(true); rackContent.setOpaque(true);
+    for (auto* component : std::initializer_list<juce::Component*> { &title, &statusLabel, &viewport }) addAndMakeVisible(component);
+    refreshCards(); startTimer(300); editorInitialised = true;
 }
 
-HostContentComponent::~HostContentComponent() { clearEditorComponent(); }
+HostContentComponent::~HostContentComponent()
+{
+    stopTimer(); detachedWindow.reset(); cards.clear(); viewport.setViewedComponent(nullptr, false);
+}
+
 void HostContentComponent::paint(juce::Graphics& g) { g.fillAll(juce::Colour(background)); }
 
 void HostContentComponent::resized()
 {
-    auto area = getLocalBounds();
-    if (!visualizerMode)
+    auto area = getLocalBounds().reduced(14);
+    auto header = area.removeFromTop(headerHeight);
+    title.setBounds(header.removeFromLeft(310));
+    addButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
+    cardStatesButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
+    foldersButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
+    settingsButton.setBounds(header.removeFromLeft(110).reduced(4, 14));
+    statusLabel.setBounds(header.reduced(8, 14));
+    viewport.setBounds(area);
+    layoutCards();
+}
+
+void HostContentComponent::refreshCards()
+{
+    auto& engine = VST3HostEngine::getInstance();
+    const auto paths = engine.getRackPluginPaths();
+    if (keyboardSlot < 0) keyboardSlot = engine.getSelectedRackSlot();
+    cards.clear(); rackContent.removeAllChildren();
+    for (int i = 0; i < paths.size(); ++i)
     {
-        auto controls = area.removeFromTop(compactControlsHeight).reduced(12, 8);
-        auto selector = controls.removeFromTop(30);
-        pluginLabel.setBounds(selector.removeFromLeft(138));
-        selector.removeFromLeft(8);
-        pluginComboBox.setBounds(selector);
-        controls.removeFromTop(6);
-        auto commands = controls.removeFromTop(32);
-        juce::TextButton* commandButtons[] = { &loadButton, &foldersButton, &removeButton, &settingsButton,
-                                               &alwaysOnTopButton, &visualizerButton, &fullscreenButton };
-        constexpr int gap = 6;
-        const int buttonWidth = (commands.getWidth() - gap * 6) / 7;
-        for (auto* button : commandButtons)
-        {
-            button->setBounds(commands.removeFromLeft(buttonWidth).withHeight(30));
-            commands.removeFromLeft(gap);
-        }
-        controls.removeFromTop(6);
-        auto info = controls;
-        detailLabel.setBounds(info.removeFromLeft(juce::roundToInt(info.getWidth() * 0.65f)));
-        info.removeFromLeft(8);
-        statusLabel.setBounds(info);
+        auto* card = cards.add(new RackCardComponent(*this, i, expandedSlots.contains(i), i == keyboardSlot));
+        rackContent.addAndMakeVisible(card);
     }
-    if (activeEditor)
+    if (juce::isPositiveAndBelow(keyboardSlot, paths.size())) engine.selectRackSlot(keyboardSlot);
+    lastRackPaths = paths; layoutCards();
+}
+
+void HostContentComponent::layoutCards()
+{
+    const auto width = juce::jmax(720, viewport.getWidth() - viewport.getScrollBarThickness());
+    int y = cardGap;
+    for (auto* card : cards)
     {
-        auto editorArea = area;
-        const auto* window = findParentComponentOfClass<HostWindow>();
-        const bool fullscreen = window != nullptr && window->isFullScreen();
-        if (!fullscreen && preferredEditorSize.x > 0 && preferredEditorSize.y > 0)
-            editorArea = area.withSizeKeepingCentre(juce::jmin(area.getWidth(), preferredEditorSize.x),
-                                                    juce::jmin(area.getHeight(), preferredEditorSize.y));
-        activeEditor->setBounds(editorArea);
+        const auto height = card->preferredHeight();
+        card->setBounds(cardGap, y, width - cardGap * 2, height);
+        y += height + cardGap;
     }
-    else noEditorLabel.setBounds(area);
+    rackContent.setSize(width, juce::jmax(viewport.getHeight(), y));
 }
 
-void HostContentComponent::setVisualizerMode(bool enabled)
+void HostContentComponent::toggleSlotEditor(int index)
 {
-    if (visualizerMode == enabled) return;
-    visualizerMode = enabled;
-    for (auto* c : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &foldersButton,
-                     &removeButton, &settingsButton, &alwaysOnTopButton,
-                     &visualizerButton, &fullscreenButton, &statusLabel, &detailLabel }) c->setVisible(!enabled);
-    resized(); repaint();
+    if (expandedSlots.contains(index)) expandedSlots.removeFirstMatchingValue(index);
+    else expandedSlots.add(index);
+    keyboardSlot = index;
+    refreshCards();
+    if (juce::isPositiveAndBelow(index, cards.size()))
+        viewport.getVerticalScrollBar().setCurrentRangeStart(cards[index]->getY());
 }
 
-void HostContentComponent::updateWindowModeButtons()
+void HostContentComponent::activateSlot(int index)
 {
-    const auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-    alwaysOnTopButton.setToggleState(settings.alwaysOnTop, juce::dontSendNotification);
-    visualizerButton.setToggleState(settings.visualizerMode, juce::dontSendNotification);
-    fullscreenButton.setToggleState(settings.fullscreen, juce::dontSendNotification);
+    if (!juce::isPositiveAndBelow(index, cards.size())) return;
+    keyboardSlot = index;
+    VST3HostEngine::getInstance().selectRackSlot(index);
+    for (int i = 0; i < cards.size(); ++i) cards[i]->setActive(i == index);
 }
 
-void HostContentComponent::mouseDoubleClick(const juce::MouseEvent& event)
+void HostContentComponent::selectAdjacentGui(int delta)
 {
-    const auto y = event.getEventRelativeTo(this).y;
-    if (!visualizerMode && y >= 196 && y <= 282)
-        if (auto* window = findParentComponentOfClass<HostWindow>()) window->toggleMaximized();
+    const auto count = VST3HostEngine::getInstance().getRackSize();
+    if (count == 0) return;
+    keyboardSlot = (juce::jmax(0, keyboardSlot) + delta + count) % count;
+    expandedSlots.clear();
+    expandedSlots.add(keyboardSlot);
+    refreshCards();
+    viewport.getVerticalScrollBar().setCurrentRangeStart(cards[keyboardSlot]->getY());
 }
 
-bool HostContentComponent::keyPressed(const juce::KeyPress& key, juce::Component*)
+void HostContentComponent::moveSlot(int from, int to)
 {
-    if (auto* window = findParentComponentOfClass<HostWindow>()) return window->keyPressed(key);
-    return false;
-}
-
-void HostContentComponent::comboBoxChanged(juce::ComboBox*)
-{
-    if (changingPlugin) return;
-    const int index = pluginComboBox.getSelectedId() - 2;
-    if (index < 0)
+    const auto count = VST3HostEngine::getInstance().getRackSize();
+    if (!juce::isPositiveAndBelow(from, count) || !juce::isPositiveAndBelow(to, count) || from == to) return;
+    VST3HostEngine::getInstance().moveRackSlot(from, to);
+    const auto remap = [from, to](int index)
     {
-        clearEditorComponent();
-        VST3HostEngine::getInstance().acceptExplicitBypass();
-        VST3HostEngine::getInstance().unloadPlugin();
-        VST3HostEngine::getInstance().saveState();
+        if (index == from) return to;
+        if (from < to && index > from && index <= to) return index - 1;
+        if (from > to && index >= to && index < from) return index + 1;
+        return index;
+    };
+    for (int i = 0; i < expandedSlots.size(); ++i) expandedSlots.set(i, remap(expandedSlots[i]));
+    if (keyboardSlot >= 0) keyboardSlot = remap(keyboardSlot);
+    refreshCards();
+}
+
+void HostContentComponent::removeSlot(int index)
+{
+    cards.clear();
+    VST3HostEngine::getInstance().removeRackSlot(index);
+    expandedSlots.removeFirstMatchingValue(index);
+    for (int i = 0; i < expandedSlots.size(); ++i)
+        if (expandedSlots[i] > index) expandedSlots.set(i, expandedSlots[i] - 1);
+    if (keyboardSlot == index) keyboardSlot = -1;
+    else if (keyboardSlot > index) --keyboardSlot;
+    refreshCards();
+}
+
+void HostContentComponent::cloneSlot(int index, bool above)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (engine.getRackSize() >= bridge::maxRackSlots)
+    { statusLabel.setText("Rack full: maximum 10 slots.", false); return; }
+    const auto target = above ? index : index + 1;
+    if (engine.cloneRackSlot(index, target))
+    {
+        for (int i = 0; i < expandedSlots.size(); ++i)
+            if (expandedSlots[i] >= target) expandedSlots.set(i, expandedSlots[i] + 1);
+        expandedSlots.addIfNotAlreadyThere(target);
+        keyboardSlot = target;
+        refreshCards();
+    }
+}
+
+void HostContentComponent::reloadSlot(int index)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (!beginReplacement(index)) return;
+    const auto path = replacedPluginPath;
+    if (!engine.loadPlugin(path, false))
+    {
+        rollbackReplacement();
         return;
     }
-    if (!juce::isPositiveAndBelow(index, records.size())) return;
-    const auto& record = records.getReference(index);
-    if (record.status != "Compatible" || record.scannerQuarantined || record.runtimeQuarantined)
-    { statusLabel.setText(record.status + ": " + record.lastError, false); return; }
+    if (auto* plugin = engine.getRackPluginInstance(engine.getRackSize() - 1))
+        plugin->setStateInformation(replacedPluginState.getData(), static_cast<int>(replacedPluginState.getSize()));
+    finishReplacement();
+    statusLabel.setText("Reloaded VST3: " + juce::File(path).getFileNameWithoutExtension(), false);
+}
+
+void HostContentComponent::setSlotMuted(int index, bool muted) { VST3HostEngine::getInstance().setRackSlotMuted(index, muted); }
+void HostContentComponent::setSlotSolo(int index, bool solo) { VST3HostEngine::getInstance().setRackSlotSolo(index, solo); }
+
+void HostContentComponent::showAddMenu(int insertAt)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (engine.getRackSize() >= bridge::maxRackSlots)
+    { statusLabel.setText("Rack full: maximum 10 slots.", false); return; }
+    records = engine.getPluginRecords();
+    juce::PopupMenu menu;
+    menu.addItem(1, "Add VST...");
+    if (!records.isEmpty()) menu.addSeparator();
+    for (int i = 0; i < records.size(); ++i)
+    {
+        const auto& record = records.getReference(i);
+        const bool compatible = record.status == "Compatible" && !record.scannerQuarantined && !record.runtimeQuarantined;
+        const auto label = (record.name.isNotEmpty() ? record.name : juce::File(record.canonicalPath).getFileNameWithoutExtension())
+            + " | " + (record.manufacturer.isNotEmpty() ? record.manufacturer : "Unknown company")
+            + " | " + (record.category.isNotEmpty() ? record.category : "Unclassified")
+            + " | " + bridge::architectureName(record.architecture);
+        menu.addItem(1000 + i, label, compatible);
+    }
+    auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+    const auto mouse = juce::Desktop::getInstance().getMainMouseSource().getScreenPosition().roundToInt();
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea({ mouse.x, mouse.y, 1, 1 }), [safe, insertAt](int result)
+    {
+        if (safe == nullptr || result == 0) return;
+        if (result == 1)
+        {
+            safe->fileChooser = std::make_unique<juce::FileChooser>("Add VST3 plug-in", juce::File(), "*.vst3");
+            auto nestedSafe = juce::Component::SafePointer<HostContentComponent>(safe.getComponent());
+            safe->fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                [nestedSafe, insertAt](const juce::FileChooser& chooser)
+                {
+                    if (nestedSafe == nullptr || !chooser.getResult().exists()) return;
+                    nestedSafe->pendingInsertAt = insertAt;
+                    nestedSafe->pendingRackSize = VST3HostEngine::getInstance().getRackSize();
+                    VST3HostEngine::getInstance().scanFileAndLoad(chooser.getResult());
+                });
+        }
+        else safe->addPluginRecord(result - 1000, insertAt);
+    });
+}
+
+void HostContentComponent::showReplaceMenu(int index)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (!juce::isPositiveAndBelow(index, engine.getRackSize())) return;
+    records = engine.getPluginRecords();
+    juce::PopupMenu menu;
+    menu.addItem(1, "Add VST...");
+    if (!records.isEmpty()) menu.addSeparator();
+    for (int i = 0; i < records.size(); ++i)
+    {
+        const auto& record = records.getReference(i);
+        const bool compatible = record.status == "Compatible" && !record.scannerQuarantined
+                             && !record.runtimeQuarantined && record.architecture == bridge::currentArchitecture();
+        const auto label = (record.name.isNotEmpty() ? record.name : juce::File(record.canonicalPath).getFileNameWithoutExtension())
+            + " | " + (record.manufacturer.isNotEmpty() ? record.manufacturer : "Unknown company")
+            + " | " + (record.category.isNotEmpty() ? record.category : "Unclassified")
+            + " | " + bridge::architectureName(record.architecture);
+        menu.addItem(1000 + i, label, compatible);
+    }
+    auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+    const auto mouse = juce::Desktop::getInstance().getMainMouseSource().getScreenPosition().roundToInt();
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea({ mouse.x, mouse.y, 1, 1 }), [safe, index](int result)
+    {
+        if (safe == nullptr || result == 0) return;
+        if (result == 1)
+        {
+            safe->fileChooser = std::make_unique<juce::FileChooser>("Replace with VST3 plug-in", juce::File(), "*.vst3");
+            auto nestedSafe = juce::Component::SafePointer<HostContentComponent>(safe.getComponent());
+            safe->fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                [nestedSafe, index](const juce::FileChooser& chooser)
+                {
+                    if (nestedSafe == nullptr || !chooser.getResult().exists()) return;
+                    auto& nestedEngine = VST3HostEngine::getInstance();
+                    if (nestedEngine.isScanning())
+                    { nestedSafe->statusLabel.setText("Wait for the current VST3 scan to finish.", false); return; }
+                    if (!nestedSafe->beginReplacement(index)) return;
+                    nestedSafe->pendingRackSize = nestedEngine.getRackSize();
+                    nestedSafe->pendingReplaceScan = true;
+                    nestedSafe->pendingReplaceIdleTicks = 0;
+                    nestedEngine.scanFileAndLoad(chooser.getResult());
+                });
+        }
+        else safe->replacePluginRecord(result - 1000, index);
+    });
+}
+
+bool HostContentComponent::beginReplacement(int index)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (!juce::isPositiveAndBelow(index, engine.getRackSize()) || pendingReplaceAt >= 0) return false;
+    auto* plugin = engine.getRackPluginInstance(index);
+    const auto paths = engine.getRackPluginPaths();
+    if (plugin == nullptr || !juce::isPositiveAndBelow(index, paths.size())) return false;
+    replacedPluginPath = paths[index];
+    replacedPluginState.reset();
+    {
+        const juce::ScopedLock callbackLock(plugin->getCallbackLock());
+        plugin->getStateInformation(replacedPluginState);
+    }
+    replacedPluginMuted = engine.isRackSlotMuted(index);
+    replacedPluginSolo = engine.isRackSlotSolo(index);
+    replacedPluginEditorHeight = engine.getRackSlotEditorHeight(index);
+    pendingReplaceAt = index;
+    detachedWindow.reset();
+    cards.clear();
+    rackContent.removeAllChildren();
+    engine.removeRackSlot(index);
+    return true;
+}
+
+void HostContentComponent::finishReplacement()
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (pendingReplaceAt < 0 || engine.getRackSize() == 0) return;
+    const auto last = engine.getRackSize() - 1;
+    const auto target = juce::jlimit(0, last, pendingReplaceAt);
+    if (last != target) engine.moveRackSlot(last, target);
+    engine.setRackSlotMuted(target, replacedPluginMuted);
+    engine.setRackSlotSolo(target, replacedPluginSolo);
+    engine.setRackSlotEditorHeight(target, replacedPluginEditorHeight);
+    keyboardSlot = target;
+    expandedSlots.addIfNotAlreadyThere(target);
+    pendingReplaceAt = pendingRackSize = -1;
+    pendingReplaceScan = false;
+    pendingReplaceIdleTicks = 0;
+    replacedPluginPath.clear();
+    replacedPluginState.reset();
+    engine.saveState();
+    refreshCards();
+}
+
+void HostContentComponent::rollbackReplacement()
+{
+    auto& engine = VST3HostEngine::getInstance();
+    const auto target = pendingReplaceAt;
+    const auto oldPath = replacedPluginPath;
+    const auto oldState = replacedPluginState;
+    const auto oldMuted = replacedPluginMuted;
+    const auto oldSolo = replacedPluginSolo;
+    const auto oldHeight = replacedPluginEditorHeight;
+    pendingReplaceAt = pendingRackSize = -1;
+    pendingReplaceScan = false;
+    pendingReplaceIdleTicks = 0;
+    if (target < 0 || oldPath.isEmpty() || !engine.loadPlugin(oldPath, false))
+    {
+        statusLabel.setText("Replacement failed and the previous VST3 could not be restored. See the rack log.", false);
+        refreshCards();
+        return;
+    }
+    const auto last = engine.getRackSize() - 1;
+    if (auto* plugin = engine.getRackPluginInstance(last))
+        plugin->setStateInformation(oldState.getData(), static_cast<int>(oldState.getSize()));
+    const auto restored = juce::jlimit(0, last, target);
+    if (last != restored) engine.moveRackSlot(last, restored);
+    engine.setRackSlotMuted(restored, oldMuted);
+    engine.setRackSlotSolo(restored, oldSolo);
+    engine.setRackSlotEditorHeight(restored, oldHeight);
+    replacedPluginPath.clear();
+    replacedPluginState.reset();
+    statusLabel.setText("Could not load the replacement; the previous VST3 was restored.", false);
+    engine.saveState();
+    refreshCards();
+}
+
+void HostContentComponent::replacePluginRecord(int recordIndex, int index)
+{
+    if (!juce::isPositiveAndBelow(recordIndex, records.size())) return;
+    auto& engine = VST3HostEngine::getInstance();
+    const auto& record = records.getReference(recordIndex);
+    if (record.architecture != bridge::currentArchitecture())
+    { statusLabel.setText("Replacement must use the rack helper architecture.", false); return; }
+    const auto path = record.location.resolve(engine.getRuntimePaths()).getFullPathName();
+    if (!beginReplacement(index)) return;
+    if (!engine.loadPlugin(path, false)) { rollbackReplacement(); return; }
+    finishReplacement();
+}
+
+void HostContentComponent::addPluginRecord(int recordIndex, int insertAt)
+{
+    if (!juce::isPositiveAndBelow(recordIndex, records.size())) return;
+    auto& engine = VST3HostEngine::getInstance();
+    const auto& record = records.getReference(recordIndex);
     if ((record.architecture == bridge::Architecture::x86 || record.architecture == bridge::Architecture::x64)
         && record.architecture != bridge::currentArchitecture())
     {
-        statusLabel.setText("Switching to the " + bridge::architectureName(record.architecture) + " helper...", false);
-        VST3HostEngine::getInstance().requestHostArchitecture(record);
-        return;
+        if (engine.getRackSize() > 0)
+        { statusLabel.setText("A rack cannot mix x86 and x64 VST3 helpers.", false); return; }
+        engine.requestHostArchitecture(record); return;
     }
-    clearEditorComponent();
-    if (VST3HostEngine::getInstance().loadPlugin(record.location.resolve(VST3HostEngine::getInstance().getRuntimePaths()).getFullPathName()))
-    {
-        refreshEditorComponent();
-        lastActivePath = VST3HostEngine::getInstance().getActivePluginPath();
-        updatePluginList();
-        VST3HostEngine::getInstance().saveState();
-    }
+    if (!engine.loadPlugin(record.location.resolve(engine.getRuntimePaths()).getFullPathName()))
+    { statusLabel.setText("Could not load " + record.name + ". See the rack log for details.", false); return; }
+    const auto last = engine.getRackSize() - 1;
+    const auto target = juce::jlimit(0, last, insertAt);
+    if (last != target) engine.moveRackSlot(last, target);
+    for (int i = 0; i < expandedSlots.size(); ++i)
+        if (expandedSlots[i] >= target) expandedSlots.set(i, expandedSlots[i] + 1);
+    expandedSlots.addIfNotAlreadyThere(target);
+    keyboardSlot = target;
+    engine.saveState(); refreshCards();
 }
 
 void HostContentComponent::buttonClicked(juce::Button* button)
 {
-    if (button == &alwaysOnTopButton || button == &visualizerButton)
-    {
-        auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-        if (button == &alwaysOnTopButton) settings.alwaysOnTop = !settings.alwaysOnTop;
-        else settings.visualizerMode = !settings.visualizerMode;
-        VST3HostEngine::getInstance().updateSettings(settings);
-        if (auto* window = findParentComponentOfClass<HostWindow>()) window->applyWindowSettings();
-    }
-    else if (button == &fullscreenButton)
-    {
-        if (auto* window = findParentComponentOfClass<HostWindow>()) window->toggleFullscreen();
-    }
-    else if (button == &loadButton)
-    {
-        fileChooser = std::make_unique<juce::FileChooser>("Select VST3 plug-in", juce::File(), "*.vst3");
-        auto safe = juce::Component::SafePointer<HostContentComponent>(this);
-        fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-            [safe](const juce::FileChooser& chooser) { if (safe != nullptr && chooser.getResult().exists()) VST3HostEngine::getInstance().scanFileAndLoad(chooser.getResult()); });
-    }
+    if (button == &addButton) showAddMenu(VST3HostEngine::getInstance().getRackSize());
+    else if (button == &cardStatesButton) showCardStatesMenu();
     else if (button == &foldersButton) openFolderManager();
-    else if (button == &removeButton)
-    {
-        const int index = pluginComboBox.getSelectedId() - 2;
-        if (juce::isPositiveAndBelow(index, records.size()))
-        {
-            const auto record = records.getReference(index);
-            const bool failed = record.scannerQuarantined || record.runtimeQuarantined || record.status != "Compatible";
-            juce::PopupMenu menu;
-            if (failed) menu.addItem(1, "Retry and reset quarantine");
-            const auto resolved = record.location.resolve(VST3HostEngine::getInstance().getRuntimePaths());
-            const bool active = resolved.getFullPathName().equalsIgnoreCase(VST3HostEngine::getInstance().getActivePluginPath());
-            menu.addItem(4, "Reset Parameters", active);
-            menu.addItem(5, "Reset Size", active);
-            menu.addItem(2, "Forget");
-            menu.addItem(3, "Open file location");
-            auto safe = juce::Component::SafePointer<HostContentComponent>(this);
-            menu.showMenuAsync({}, [record, safe](int result)
-            {
-                auto& engine = VST3HostEngine::getInstance();
-                if (result == 1) engine.retryPlugin(record.canonicalPath);
-                else if (result == 2) engine.removePluginFromList(record.canonicalPath);
-                else if (result == 3) bridge::vst3BundleRoot(record.location.resolve(engine.getRuntimePaths())).getParentDirectory().startAsProcess();
-                else if (result == 4 && safe != nullptr) safe->resetPluginParameters();
-                else if (result == 5 && safe != nullptr) safe->resetEditorSize();
-            });
-        }
-    }
-    else if (button == &settingsButton)
-    {
-        if (settingsWindow != nullptr && settingsWindow->getPeer() == nullptr) settingsWindow.reset();
-        if (settingsWindow == nullptr)
-        {
-            juce::DialogWindow::LaunchOptions options; options.dialogTitle = "VST3 Bridge Settings";
-            options.content.setOwned(new SettingsComponent());
-            options.useNativeTitleBar = true; options.resizable = true;
-            settingsWindow.reset(options.create());
-        }
-        settingsWindow->setVisible(true);
-        settingsWindow->setEnabled(true);
-        settingsWindow->toFront(true);
-    }
+    else if (button == &settingsButton) openSettings();
 }
 
 void HostContentComponent::timerCallback()
 {
-    VST3HostEngine::getInstance().flushPendingStateSave();
-    const auto revision = VST3HostEngine::getInstance().getEditorStateRevision();
-    if (revision != lastEditorStateRevision)
-    {
-        lastEditorStateRevision = revision;
-        if (activeEditor)
-        {
-            refreshEditorComponent();
-            preferredEditorSize = initialEditorSize;
-            resized();
-        }
-    }
-    if (activeEditor)
-    {
-        auto canvas = getLocalBounds();
-        if (!visualizerMode) canvas.removeFromTop(compactControlsHeight);
-        auto expected = canvas;
-        const auto* window = findParentComponentOfClass<HostWindow>();
-        const bool fullscreen = window != nullptr && window->isFullScreen();
-        if (!fullscreen && preferredEditorSize.x > 0 && preferredEditorSize.y > 0)
-            expected = canvas.withSizeKeepingCentre(juce::jmin(canvas.getWidth(), preferredEditorSize.x),
-                                                    juce::jmin(canvas.getHeight(), preferredEditorSize.y));
-        if (activeEditor->getBounds() != expected)
-        {
-            if (!fullscreen)
-                preferredEditorSize = { activeEditor->getWidth(), activeEditor->getHeight() };
-            resized();
-        }
-    }
-    if (editorLayoutPassesRemaining > 0)
-    {
-        resized();
-        if (activeEditor) activeEditor->resized();
-        --editorLayoutPassesRemaining;
-    }
-    const auto active = VST3HostEngine::getInstance().getActivePluginPath();
-    if (records.size() != VST3HostEngine::getInstance().getPluginRecords().size() || active != lastActivePath || VST3HostEngine::getInstance().isScanning()) updatePluginList();
-    if (active != lastActivePath)
-    {
-        lastActivePath = active;
-        refreshEditorComponent();
-    }
-    const auto progress = VST3HostEngine::getInstance().getScanProgress();
-    if (progress.isNotEmpty())
-    {
-        statusLabel.setText(progress, false);
-        statusLabel.setTooltip(progress);
-    }
-    updateWindowModeButtons();
-}
-
-void HostContentComponent::updatePluginList()
-{
-    records = VST3HostEngine::getInstance().getPluginRecords();
-    const auto active = VST3HostEngine::getInstance().getActivePluginPath();
-    const juce::ScopedValueSetter<bool> guard(changingPlugin, true);
-    pluginComboBox.clear(juce::dontSendNotification); pluginComboBox.addItem("[None - Bypass]", 1);
-    int selected = 1;
-    for (int i = 0; i < records.size(); ++i)
-    {
-        const auto& r = records.getReference(i);
-        auto label = (r.name.isNotEmpty() ? r.name : juce::File(r.canonicalPath).getFileNameWithoutExtension())
-            + (r.manufacturer.isNotEmpty() ? " - " + r.manufacturer : juce::String())
-            + (r.category.isNotEmpty() ? " (" + r.category + ")" : juce::String())
-            + " [" + bridge::architectureName(r.architecture)
-            + (r.status == "Compatible" ? "]" : ", " + r.status + "]");
-        pluginComboBox.addItem(label, i + 2);
-        if (r.canonicalPath.equalsIgnoreCase(bridge::canonicalPath(bridge::vst3BundleRoot(juce::File(active))))) selected = i + 2;
-    }
-    pluginComboBox.setSelectedId(selected, juce::dontSendNotification);
-    if (selected > 1)
-    {
-        const auto& r = records.getReference(selected - 2);
-        removeButton.setButtonText("Plugin Actions...");
-        juce::StringArray details;
-        details.add("Name: " + (r.descriptiveName.isNotEmpty() ? r.descriptiveName
-            : r.name.isNotEmpty() ? r.name : juce::File(r.canonicalPath).getFileNameWithoutExtension()));
-        if (r.manufacturer.isNotEmpty()) details.add("Company: " + r.manufacturer);
-        if (r.version.isNotEmpty()) details.add("Version: " + r.version);
-        details.add("Path: " + r.canonicalPath);
-        const auto text = details.joinIntoString(" | ");
-        detailLabel.setText(text, false);
-        detailLabel.setTooltip(text);
-    }
-    else
-    {
-        removeButton.setButtonText("Plugin Actions...");
-        detailLabel.setText("Bypass active | No VST3 is processing audio", false);
-        detailLabel.setTooltip("Bypass is active. Audio passes through the bridge without VST3 processing.");
-    }
-}
-
-void HostContentComponent::clearEditorComponent()
-{
-    editorLayoutPassesRemaining = 0;
-    initialEditorSize = {};
-    preferredEditorSize = {};
-    if (activeEditor)
-    {
-        activeEditor->removeKeyListener(this);
-        activeEditor->removeMouseListener(this);
-        removeChildComponent(activeEditor.get());
-        activeEditor.reset();
-    }
-}
-
-void HostContentComponent::resetPluginParameters()
-{
-    clearEditorComponent();
-    VST3HostEngine::getInstance().resetActivePluginParameters();
-    refreshEditorComponent();
-}
-
-void HostContentComponent::resetEditorSize()
-{
-    preferredEditorSize = {};
-    if (auto* window = findParentComponentOfClass<HostWindow>()) window->resetToComfortableSize();
-}
-
-void HostContentComponent::refreshEditorComponent()
-{
-    editorInitialised = false;
-    clearEditorComponent();
     auto& engine = VST3HostEngine::getInstance();
-    const bool restoringState = engine.hasPendingPluginState();
-    engine.applyPendingPluginState();
-    auto* plugin = engine.getPluginInstance();
-    if (plugin != nullptr && plugin->hasEditor())
+    if (detachedWindow != nullptr && !detachedWindow->isVisible()) detachedWindow.reset();
+    engine.flushPendingStateSave();
+    if (pendingReplaceScan)
     {
-        VST3HostEngine::getInstance().writeLog("Creating VST3 editor");
-        activeEditor.reset(plugin->createEditorAndMakeActive());
-        VST3HostEngine::getInstance().writeLog("VST3 editor creation returned");
-        if (activeEditor)
-        {
-            initialEditorSize = { activeEditor->getWidth(), activeEditor->getHeight() };
-            if (restoringState) preferredEditorSize = initialEditorSize;
-            activeEditor->addKeyListener(this);
-            activeEditor->addMouseListener(this, true);
-            addAndMakeVisible(activeEditor.get());
-            editorLayoutPassesRemaining = 2;
-        }
+        if (engine.getRackSize() > pendingRackSize)
+            finishReplacement();
+        else if (engine.isScanning())
+            pendingReplaceIdleTicks = 0;
+        else if (++pendingReplaceIdleTicks >= 3)
+            rollbackReplacement();
     }
-    noEditorLabel.setVisible(activeEditor == nullptr);
-    if (activeEditor == nullptr) editorLayoutPassesRemaining = 0;
-    editorInitialised = true;
-    lastEditorStateRevision = engine.getEditorStateRevision();
-    resized();
-    auto safe = juce::Component::SafePointer<HostContentComponent>(this);
-    juce::MessageManager::callAsync([safe]
+    if (pendingRackSize >= 0 && engine.getRackSize() > pendingRackSize)
     {
-        if (safe == nullptr || safe->activeEditor == nullptr) return;
-        safe->resized();
-        safe->activeEditor->resized();
+        const auto last = engine.getRackSize() - 1;
+        const auto target = juce::jlimit(0, last, pendingInsertAt);
+        if (last != target) engine.moveRackSlot(last, target);
+        for (int i = 0; i < expandedSlots.size(); ++i)
+            if (expandedSlots[i] >= target) expandedSlots.set(i, expandedSlots[i] + 1);
+        expandedSlots.addIfNotAlreadyThere(target);
+        keyboardSlot = target;
+        pendingRackSize = pendingInsertAt = -1;
+    }
+    if (engine.getRackPluginPaths() != lastRackPaths) refreshCards();
+    const auto progress = engine.getScanProgress();
+    if (progress.isNotEmpty()) statusLabel.setText(progress, false);
+}
+
+bool HostContentComponent::isInterestedInDragSource(const SourceDetails& details) { return details.description.isInt(); }
+
+void HostContentComponent::itemDragEnter(const SourceDetails& details) { updateDropIndicator(details); }
+void HostContentComponent::itemDragMove(const SourceDetails& details) { updateDropIndicator(details); }
+
+void HostContentComponent::itemDragExit(const SourceDetails& details)
+{
+    if (details.sourceComponent != nullptr) details.sourceComponent->setAlpha(1.0f);
+    clearDropIndicator();
+}
+
+void HostContentComponent::itemDropped(const SourceDetails& details)
+{
+    const auto from = static_cast<int>(details.description);
+    if (details.sourceComponent != nullptr) details.sourceComponent->setAlpha(1.0f);
+    const auto insertion = dropInsertion;
+    clearDropIndicator();
+    if (insertion < 0 || cards.isEmpty()) return;
+    const auto target = juce::jlimit(0, cards.size() - 1, insertion > from ? insertion - 1 : insertion);
+    moveSlot(from, target);
+}
+
+void HostContentComponent::updateDropIndicator(const SourceDetails& details)
+{
+    if (details.sourceComponent != nullptr) details.sourceComponent->setAlpha(0.55f);
+    const auto rackY = details.localPosition.y - viewport.getY() + viewport.getViewPositionY();
+    int insertion = cards.size();
+    for (int i = 0; i < cards.size(); ++i)
+        if (rackY < cards[i]->getBounds().getCentreY()) { insertion = i; break; }
+    for (auto* card : cards) card->setDropIndicator(0);
+    if (!cards.isEmpty())
+    {
+        if (insertion == cards.size()) cards.getLast()->setDropIndicator(1);
+        else cards[insertion]->setDropIndicator(-1);
+    }
+    dropInsertion = insertion;
+}
+
+void HostContentComponent::clearDropIndicator()
+{
+    for (auto* card : cards) card->setDropIndicator(0);
+    dropInsertion = -1;
+}
+
+void HostContentComponent::showCardStatesMenu()
+{
+    juce::PopupMenu menu;
+    menu.addItem(1, "Expand all cards");
+    menu.addItem(2, "Collapse all cards");
+    menu.addSeparator();
+    menu.addItem(3, "Remove all cards", !cards.isEmpty());
+    auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&cardStatesButton), [safe](int result)
+    {
+        if (safe == nullptr || result == 0) return;
+        if (result == 1)
+        {
+            safe->expandedSlots.clear();
+            for (int i = 0; i < VST3HostEngine::getInstance().getRackSize(); ++i) safe->expandedSlots.add(i);
+            safe->refreshCards();
+        }
+        else if (result == 2)
+        {
+            safe->expandedSlots.clear();
+            safe->refreshCards();
+        }
+        else if (result == 3)
+        {
+            safe->cards.clear();
+            safe->expandedSlots.clear();
+            safe->keyboardSlot = -1;
+            VST3HostEngine::getInstance().clearRack();
+            safe->refreshCards();
+        }
     });
 }
 
-void HostContentComponent::ensureEditorInitialised()
+void HostContentComponent::resetSlotParameters(int index)
 {
-    if (activeEditor == nullptr && VST3HostEngine::getInstance().getPluginInstance() != nullptr)
-        refreshEditorComponent();
+    auto& engine = VST3HostEngine::getInstance();
+    if (!juce::isPositiveAndBelow(index, engine.getRackSize())) return;
+    const auto wasMuted = engine.isRackSlotMuted(index);
+    const auto wasSolo = engine.isRackSlotSolo(index);
+    const auto editorHeight = engine.getRackSlotEditorHeight(index);
+    cards.clear();
+    engine.selectRackSlot(index);
+    engine.resetActivePluginParameters();
+    if (juce::isPositiveAndBelow(index, engine.getRackSize()))
+    {
+        engine.setRackSlotMuted(index, wasMuted);
+        engine.setRackSlotSolo(index, wasSolo);
+        if (editorHeight > 0) engine.setRackSlotEditorHeight(index, editorHeight);
+        expandedSlots.addIfNotAlreadyThere(index);
+        keyboardSlot = index;
+    }
+    refreshCards();
+}
+
+void HostContentComponent::openSlotLocation(int index)
+{
+    const auto paths = VST3HostEngine::getInstance().getRackPluginPaths();
+    if (!juce::isPositiveAndBelow(index, paths.size())) return;
+    bridge::vst3BundleRoot(juce::File(paths[index])).revealToUser();
+}
+
+void HostContentComponent::openDetachedSlot(int index, bool fullScreen)
+{
+    auto& engine = VST3HostEngine::getInstance();
+    if (!juce::isPositiveAndBelow(index, engine.getRackSize())) return;
+    detachedWindow.reset();
+    expandedSlots.removeFirstMatchingValue(index);
+    keyboardSlot = index;
+    refreshCards();
+    const auto sourceBounds = getTopLevelComponent() != nullptr ? getTopLevelComponent()->getBounds() : getScreenBounds();
+    detachedWindow = std::make_unique<DetachedEditorWindow>(index, fullScreen, sourceBounds);
+}
+
+void HostContentComponent::forgetAllPlugins()
+{
+    detachedWindow.reset();
+    cards.clear();
+    expandedSlots.clear();
+    keyboardSlot = -1;
+    records.clear();
+    VST3HostEngine::getInstance().forgetAllPlugins();
+    refreshCards();
+    statusLabel.setText("Rack cleared and all scanned VST3 entries forgotten.", false);
+}
+
+void HostContentComponent::forgetPlugin(int index)
+{
+    const auto paths = VST3HostEngine::getInstance().getRackPluginPaths();
+    if (!juce::isPositiveAndBelow(index, paths.size())) return;
+    const auto name = juce::File(paths[index]).getFileNameWithoutExtension();
+    detachedWindow.reset();
+    cards.clear();
+    expandedSlots.clear();
+    keyboardSlot = -1;
+    VST3HostEngine::getInstance().removePluginFromList(paths[index]);
+    refreshCards();
+    statusLabel.setText(name + " removed from the rack and scanned VST3 list.", false);
 }
 
 void HostContentComponent::openFolderManager()
@@ -714,35 +1231,65 @@ void HostContentComponent::openFolderManager()
     if (foldersWindow != nullptr && foldersWindow->getPeer() == nullptr) foldersWindow.reset();
     if (foldersWindow == nullptr)
     {
-        juce::DialogWindow::LaunchOptions options; options.dialogTitle = "VST3 Search Folders";
+        juce::DialogWindow::LaunchOptions options; options.dialogTitle = "VST3 Bridge Rack For AIMP - Scan Folders";
         options.content.setOwned(new FolderManagerComponent()); options.useNativeTitleBar = true; options.resizable = true;
         foldersWindow.reset(options.create());
     }
-    foldersWindow->setVisible(true);
-    foldersWindow->setEnabled(true);
-    foldersWindow->toFront(true);
+    foldersWindow->setVisible(true); foldersWindow->toFront(true);
+}
+
+void HostContentComponent::openSettings()
+{
+    if (settingsWindow != nullptr && settingsWindow->getPeer() == nullptr) settingsWindow.reset();
+    if (settingsWindow == nullptr)
+    {
+        juce::DialogWindow::LaunchOptions options; options.dialogTitle = "VST3 Bridge Rack For AIMP - Settings";
+        auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+        options.content.setOwned(new SettingsComponent([safe] { if (safe != nullptr) safe->forgetAllPlugins(); }));
+        options.useNativeTitleBar = true; options.resizable = false;
+        settingsWindow.reset(options.create());
+    }
+    settingsWindow->setVisible(true); settingsWindow->toFront(true);
+}
+
+void HostContentComponent::ensureEditorInitialised()
+{
+    if (cards.isEmpty() && VST3HostEngine::getInstance().getRackSize() > 0) refreshCards();
 }
 
 HostWindow::HostWindow(bool preloadHidden)
-    : DocumentWindow("AIMP VST3 Host Bridge", juce::Colour(background), DocumentWindow::allButtons)
+    : DocumentWindow("VST3 Bridge Rack For AIMP", juce::Colour(background), DocumentWindow::allButtons)
 {
-    VST3HostEngine::getInstance().writeLog("Bridge DocumentWindow base created");
-    bridgeLookAndFeel.setColourScheme(juce::LookAndFeel_V4::getDarkColourScheme());
-    setLookAndFeel(&bridgeLookAndFeel);
-    setUsingNativeTitleBar(true);
-    VST3HostEngine::getInstance().writeLog("Bridge native peer configured");
+    rackLookAndFeel.setColourScheme(juce::LookAndFeel_V4::getDarkColourScheme());
+    setLookAndFeel(&rackLookAndFeel); setUsingNativeTitleBar(true);
     setContentOwned(new HostContentComponent(), true);
-    VST3HostEngine::getInstance().writeLog("Bridge content attached");
-    setResizable(true, true);
-    setResizeLimits(1050, 520, 8192, 8192);
-    setWantsKeyboardFocus(true);
-    applyWindowSettings();
+    setResizable(true, true); setResizeLimits(1100, 620, 3840, 2400);
+    centreWithSize(1600, 900); setWantsKeyboardFocus(true);
     if (preloadHidden) setAlpha(0.0f);
     setVisible(true);
-    applyWindowSettings();
 }
 
-HostWindow::~HostWindow() { persistWindowState(); clearContentComponent(); setLookAndFeel(nullptr); }
+HostWindow::~HostWindow() { clearContentComponent(); setLookAndFeel(nullptr); }
+void HostWindow::closeButtonPressed() { VST3HostEngine::getInstance().saveState(); setVisible(false); }
+
+bool HostWindow::keyPressed(const juce::KeyPress& key)
+{
+    if (key.getKeyCode() == juce::KeyPress::F11Key)
+    {
+        if (auto* content = dynamic_cast<HostContentComponent*>(getContentComponent()))
+            content->openDetachedSlot(VST3HostEngine::getInstance().getSelectedRackSlot(), true);
+        return true;
+    }
+    if (key.getKeyCode() == juce::KeyPress::leftKey || key.getKeyCode() == juce::KeyPress::upKey
+        || key.getKeyCode() == juce::KeyPress::rightKey || key.getKeyCode() == juce::KeyPress::downKey)
+    {
+        if (auto* content = dynamic_cast<HostContentComponent*>(getContentComponent()))
+            content->selectAdjacentGui(key.getKeyCode() == juce::KeyPress::leftKey || key.getKeyCode() == juce::KeyPress::upKey ? -1 : 1);
+        return true;
+    }
+    return false;
+}
+
 bool HostWindow::isEditorInitialised() const
 {
     const auto* content = dynamic_cast<const HostContentComponent*>(getContentComponent());
@@ -751,131 +1298,13 @@ bool HostWindow::isEditorInitialised() const
 
 void HostWindow::finishPreload(bool show)
 {
-    setVisible(false);
-    setAlpha(1.0f);
-    if (show) setVisible(true);
-}
-
-void HostWindow::closeButtonPressed()
-{
-    VST3HostEngine::getInstance().saveState();
-    persistWindowState();
-    setVisible(false);
-}
-
-void HostWindow::minimiseButtonPressed() { setMinimised(true); }
-void HostWindow::maximiseButtonPressed() { toggleMaximized(); }
-
-bool HostWindow::keyPressed(const juce::KeyPress& key)
-{
-    if (key.getKeyCode() == juce::KeyPress::F11Key) { toggleFullscreen(); return true; }
-    if (key.getKeyCode() == juce::KeyPress::escapeKey)
-    {
-        const auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-        if (settings.fullscreen || settings.visualizerMode)
-        {
-            exitPresentationModes();
-            return true;
-        }
-    }
-    return false;
-}
-
-void HostWindow::moved() { DocumentWindow::moved(); schedulePersistence(); }
-void HostWindow::resized()
-{
-    DocumentWindow::resized();
-    if (!applyingState && !isFullScreen()) windowedBounds = getBounds();
-    schedulePersistence();
-}
-
-void HostWindow::schedulePersistence() { if (!applyingState) startTimer(500); }
-void HostWindow::timerCallback() { stopTimer(); persistWindowState(); }
-
-void HostWindow::applyDecorations(bool hidden, bool minimal)
-{
-    setResizable(!hidden, !hidden);
-    setDropShadowEnabled(!hidden);
-    setUsingNativeTitleBar(!hidden && !minimal);
-    setTitleBarButtonsRequired(hidden ? 0 : DocumentWindow::allButtons, false);
-    setTitleBarHeight(hidden ? 0 : minimal ? 24 : 28);
-    if (minimal) setColour(DocumentWindow::textColourId, juce::Colours::white);
-}
-
-void HostWindow::applyWindowSettings()
-{
-    const juce::ScopedValueSetter<bool> guard(applyingState, true);
-    const auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-    setAlwaysOnTop(settings.alwaysOnTop);
-    if (auto* content = dynamic_cast<HostContentComponent*>(getContentComponent()))
-    {
-        content->updateWindowModeButtons();
-        content->setVisualizerMode(settings.visualizerMode);
-    }
-    if (!restoredWindowState)
-    {
-        juce::Rectangle<int> wanted(settings.logicalWindowBounds[0], settings.logicalWindowBounds[1], settings.logicalWindowBounds[2], settings.logicalWindowBounds[3]);
-        const auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect(wanted);
-        if (display == nullptr) display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay();
-        if (display != nullptr) wanted = wanted.constrainedWithin(display->userBounds.toNearestInt());
-        setBounds(wanted);
-        windowedBounds = wanted;
-        restoredWindowState = true;
-    }
-    if (isOnDesktop() && settings.fullscreen && !isFullScreen())
-    {
-        windowedBounds = getBounds();
-        applyDecorations(true);
-        setFullScreen(true);
-        if (const auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect(windowedBounds))
-            setBounds(display->logicalBounds.toNearestInt());
-    }
-    else if (isOnDesktop() && !settings.fullscreen && isFullScreen())
-    {
-        setFullScreen(false);
-        setBounds(windowedBounds);
-        applyDecorations(false, settings.visualizerMode);
-    }
-    else
-        applyDecorations(settings.fullscreen, settings.visualizerMode);
-}
-
-void HostWindow::toggleFullscreen()
-{
-    auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-    const bool enter = !(settings.fullscreen || settings.visualizerMode);
-    settings.fullscreen = enter;
-    settings.visualizerMode = enter;
-    VST3HostEngine::getInstance().updateSettings(settings);
-    applyWindowSettings();
-}
-
-void HostWindow::toggleMaximized()
-{
-    if (isFullScreen()) { toggleFullscreen(); return; }
-    if (auto* peer = getPeer())
-    {
-        const auto window = static_cast<HWND>(peer->getNativeHandle());
-        ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
-    }
-}
-
-void HostWindow::exitPresentationModes()
-{
-    auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-    settings.fullscreen = false;
-    settings.visualizerMode = false;
-    VST3HostEngine::getInstance().updateSettings(settings);
-    applyWindowSettings();
+    setVisible(false); setAlpha(1.0f); if (show) setVisible(true);
 }
 
 void HostWindow::bringToFrontOrFlash()
 {
-    if (auto* content = dynamic_cast<HostContentComponent*>(getContentComponent()))
-        content->ensureEditorInitialised();
-    setMinimised(false);
-    setVisible(true);
-    toFront(true);
+    if (auto* content = dynamic_cast<HostContentComponent*>(getContentComponent())) content->ensureEditorInitialised();
+    setMinimised(false); setVisible(true); toFront(true);
     if (auto* peer = getPeer())
     {
         const auto window = static_cast<HWND>(peer->getNativeHandle());
@@ -885,37 +1314,4 @@ void HostWindow::bringToFrontOrFlash()
             FlashWindowEx(&info);
         }
     }
-}
-
-void HostWindow::resetToComfortableSize()
-{
-    const auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect(getBounds());
-    if (display == nullptr) return;
-    const auto available = display->userBounds.toNearestInt();
-    const auto physical = bridge::comfortableWindowPhysicalSize({ display->physicalBounds.getWidth(), display->physicalBounds.getHeight() });
-    const auto scale = juce::jmax(0.25, display->scale);
-    const auto minimumWidth = juce::jmin(1050, available.getWidth());
-    const auto minimumHeight = juce::jmin(520, available.getHeight());
-    const auto width = juce::jlimit(minimumWidth, available.getWidth(), juce::roundToInt(physical[0] / scale));
-    const auto height = juce::jlimit(minimumHeight, available.getHeight(), juce::roundToInt(physical[1] / scale));
-    setResizeLimits(minimumWidth, minimumHeight, 8192, 8192);
-    setBounds(available.withSizeKeepingCentre(width, height));
-    windowedBounds = getBounds();
-    persistWindowState();
-}
-
-void HostWindow::persistWindowState()
-{
-    if (applyingState || !isOnDesktop()) return;
-    auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
-    if (!settings.rememberWindow) return;
-    const auto bounds = isFullScreen() ? windowedBounds : getBounds();
-    settings.logicalWindowBounds = { bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight() };
-    if (auto* peer = getPeer())
-    {
-        const auto window = static_cast<HWND>(peer->getNativeHandle());
-        settings.savedDpi = static_cast<int>(GetDpiForWindow(window));
-        settings.monitorName = monitorNameForWindow(window);
-    }
-    VST3HostEngine::getInstance().updateSettings(settings);
 }

@@ -5,10 +5,15 @@
 
 #include "BridgeRuntime.h"
 
+class RackCardComponent;
+class DetachedEditorWindow;
+class RackViewport : public juce::Viewport, public juce::SettableTooltipClient { public: void paint(juce::Graphics&) override; };
+class RackCanvas : public juce::Component { public: void paint(juce::Graphics&) override; };
+
 class HostContentComponent : public juce::Component,
-                             private juce::ComboBox::Listener,
+                             public juce::DragAndDropContainer,
+                             public juce::DragAndDropTarget,
                              private juce::Button::Listener,
-                             private juce::KeyListener,
                              private juce::Timer
 {
 public:
@@ -16,85 +21,94 @@ public:
     ~HostContentComponent() override;
     void paint(juce::Graphics&) override;
     void resized() override;
-    void setVisualizerMode(bool enabled);
-    void updateWindowModeButtons();
-    bool isVisualizerMode() const { return visualizerMode; }
     bool isEditorInitialised() const { return editorInitialised; }
     void ensureEditorInitialised();
-    void mouseDoubleClick(const juce::MouseEvent&) override;
+    void selectAdjacentGui(int delta);
+
+    void toggleSlotEditor(int index);
+    void activateSlot(int index);
+    void moveSlot(int from, int to);
+    void removeSlot(int index);
+    void cloneSlot(int index, bool above);
+    void reloadSlot(int index);
+    void showAddMenu(int insertAt);
+    void showReplaceMenu(int index);
+    void setSlotMuted(int index, bool muted);
+    void setSlotSolo(int index, bool solo);
+    void resetSlotParameters(int index);
+    void openSlotLocation(int index);
+    void openDetachedSlot(int index, bool fullScreen);
+    void forgetAllPlugins();
+    void forgetPlugin(int index);
 
 private:
-    void comboBoxChanged(juce::ComboBox*) override;
     void buttonClicked(juce::Button*) override;
-    bool keyPressed(const juce::KeyPress&, juce::Component*) override;
     void timerCallback() override;
-    void updatePluginList();
-    void clearEditorComponent();
-    void refreshEditorComponent();
-    void resetPluginParameters();
-    void resetEditorSize();
+    bool isInterestedInDragSource(const SourceDetails&) override;
+    void itemDragEnter(const SourceDetails&) override;
+    void itemDragMove(const SourceDetails&) override;
+    void itemDragExit(const SourceDetails&) override;
+    void itemDropped(const SourceDetails&) override;
+    void refreshCards();
+    void layoutCards();
+    void addPluginRecord(int recordIndex, int insertAt);
+    void replacePluginRecord(int recordIndex, int index);
+    bool beginReplacement(int index);
+    void finishReplacement();
+    void rollbackReplacement();
     void openFolderManager();
+    void openSettings();
+    void showCardStatesMenu();
+    void updateDropIndicator(const SourceDetails&);
+    void clearDropIndicator();
 
-    juce::Label pluginLabel;
-    juce::ComboBox pluginComboBox;
-    juce::TextButton loadButton { "Load VST..." };
-    juce::TextButton foldersButton { "Scan Folders..." };
-    juce::TextButton removeButton { "Plugin Actions..." };
-    juce::TextButton settingsButton { "Settings..." };
-    juce::TextButton alwaysOnTopButton { "Always on Top" };
-    juce::TextButton visualizerButton { "Visualizer Mode" };
-    juce::TextButton fullscreenButton { "Fullscreen Mode" };
+    juce::Label title;
+    juce::TextButton addButton { "+  Add VST" };
+    juce::TextButton foldersButton { "Scan Folders" };
+    juce::TextButton settingsButton { "Settings" };
+    juce::TextButton cardStatesButton { "Card States..." };
     juce::TextEditor statusLabel;
-    juce::TextEditor detailLabel;
-    juce::Label noEditorLabel;
-    std::unique_ptr<juce::AudioProcessorEditor> activeEditor;
+    RackViewport viewport;
+    RackCanvas rackContent;
+    juce::OwnedArray<RackCardComponent> cards;
     juce::Array<bridge::PluginRecord> records;
+    juce::StringArray lastRackPaths;
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<juce::DialogWindow> settingsWindow;
     std::unique_ptr<juce::DialogWindow> foldersWindow;
-    bool changingPlugin = false;
-    bool visualizerMode = false;
+    std::unique_ptr<DetachedEditorWindow> detachedWindow;
+    juce::Array<int> expandedSlots;
+    int keyboardSlot = -1;
+    int dropInsertion = -1;
+    int pendingInsertAt = -1;
+    int pendingRackSize = -1;
+    int pendingReplaceAt = -1;
+    juce::String replacedPluginPath;
+    juce::MemoryBlock replacedPluginState;
+    bool replacedPluginMuted = false;
+    bool replacedPluginSolo = false;
+    int replacedPluginEditorHeight = 0;
+    bool pendingReplaceScan = false;
+    int pendingReplaceIdleTicks = 0;
     bool editorInitialised = false;
-    int editorLayoutPassesRemaining = 0;
-    juce::Point<int> initialEditorSize;
-    juce::Point<int> preferredEditorSize;
-    juce::uint32 lastEditorStateRevision = 0;
-    juce::String lastActivePath;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HostContentComponent)
 };
 
-class HostWindow : public juce::DocumentWindow, private juce::Timer
+class HostWindow : public juce::DocumentWindow
 {
 public:
     explicit HostWindow(bool preloadHidden = false);
     ~HostWindow() override;
     void closeButtonPressed() override;
-    void minimiseButtonPressed() override;
-    void maximiseButtonPressed() override;
     bool keyPressed(const juce::KeyPress&) override;
-    void moved() override;
-    void resized() override;
-    void applyWindowSettings();
-    void toggleFullscreen();
-    void toggleMaximized();
-    void exitPresentationModes();
     void bringToFrontOrFlash();
     bool isEditorInitialised() const;
     void finishPreload(bool show);
-    void resetToComfortableSize();
 
 private:
-    void timerCallback() override;
-    void applyDecorations(bool hidden, bool minimal = false);
-    void schedulePersistence();
-    void persistWindowState();
-    bool applyingState = false;
-    bool restoredWindowState = false;
-    bool maximized = false;
-    juce::Rectangle<int> windowedBounds;
-    juce::LookAndFeel_V4 bridgeLookAndFeel;
-    juce::TooltipWindow tooltipWindow { nullptr, 500 };
+    juce::LookAndFeel_V4 rackLookAndFeel;
+    juce::TooltipWindow tooltipWindow { nullptr, 450 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HostWindow)
 };

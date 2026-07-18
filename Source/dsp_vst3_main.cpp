@@ -305,14 +305,14 @@ public:
         switch (Index)
         {
         case AIMP_PLUGIN_INFO_NAME:
-            return const_cast<TChar*>(L"VST3 Bridge DSP");
+            return const_cast<TChar*>(L"VST3 Bridge Rack For AIMP");
         case AIMP_PLUGIN_INFO_AUTHOR:
             return const_cast<TChar*>(L"Ezequiel Casas (https://github.com/Mixomo)");
         case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION:
-            return const_cast<TChar*>(L"Hosts VST3 plug-ins as AIMP DSP effects");
+            return const_cast<TChar*>(L"Hosts up to ten VST3 effects in an AIMP DSP rack");
         case AIMP_PLUGIN_INFO_FULL_DESCRIPTION:
             return const_cast<TChar*>(
-                L"Hosts VST3 plug-ins as AIMP DSP effects "
+                L"Hosts up to ten ordered VST3 plug-ins as an AIMP DSP rack "
                 L"via the JUCE AudioPluginHost engine. "
                 L"Developed by Ezequiel Casas (https://github.com/Mixomo).");
         default:
@@ -468,8 +468,8 @@ static void __cdecl DspQuit(winampDSPModule* thisMod)
     StopRuntime();
 }
 
-static char g_dspModuleDescription[] = "VST3 Bridge - Mixomo";
-static char g_dspHeaderDescription[] = "VST3 Bridge - Mixomo";
+static char g_dspModuleDescription[] = "VST3 Bridge Rack for AIMP - Mixomo";
+static char g_dspHeaderDescription[] = "VST3 Bridge Rack for AIMP - Mixomo";
 
 static winampDSPModule g_dspModule = {
     g_dspModuleDescription,

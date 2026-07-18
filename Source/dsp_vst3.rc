@@ -18,14 +18,14 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Mixomo\0"
-            VALUE "FileDescription", "VST3 Bridge\0"
+            VALUE "FileDescription", "VST3 Bridge Rack For AIMP\0"
             VALUE "FileVersion", "2.0.0.0\0"
-            VALUE "InternalName", "dsp_vst3_bridge\0"
+            VALUE "InternalName", "dsp_vst3_rack\0"
             VALUE "LegalCopyright", "Developed by Ezequiel Casas (https://github.com/Mixomo)\0"
-            VALUE "OriginalFilename", "dsp_vst3_bridge.dll\0"
-            VALUE "ProductName", "VST3 Bridge\0"
+            VALUE "OriginalFilename", "dsp_vst3_rack.dll\0"
+            VALUE "ProductName", "VST3 Bridge Rack For AIMP\0"
             VALUE "ProductVersion", "2.0.0.0\0"
-            VALUE "Comments", "VST3 host bridge for AIMP DSP. Developed by Ezequiel Casas (https://github.com/Mixomo).\0"
+            VALUE "Comments", "Ten-slot VST3 rack for AIMP DSP. Developed by Ezequiel Casas (https://github.com/Mixomo).\0"
         END
     END
     BLOCK "VarFileInfo"

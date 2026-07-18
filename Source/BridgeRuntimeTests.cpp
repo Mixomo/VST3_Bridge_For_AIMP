@@ -9,8 +9,8 @@ int main()
 {
     using namespace bridge;
     const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getNonexistentChildFile("vst3_bridge_runtime_test", {}, false);
-    const auto binary = root.getChildFile("x64").getChildFile("VST3BridgeHost64.exe");
+        .getNonexistentChildFile("vst3_rack_runtime_test", {}, false);
+    const auto binary = root.getChildFile("x64").getChildFile("VST3RackHost64.exe");
     const auto profile = root.getChildFile("Profile");
     root.createDirectory();
     profile.createDirectory();
@@ -43,7 +43,6 @@ int main()
     auto* oldConfig = new juce::DynamicObject();
     oldConfig->setProperty("schemaVersion", 3);
     oldConfig->setProperty("storageMode", "portable");
-    oldConfig->setProperty("fullscreenOnStart", true);
     oldConfig->setProperty("scanOnStartup", true);
     oldConfig->setProperty("startupMode", "alwaysSelected");
     oldConfig->setProperty("startupPlugin", PathReference { "absolute", nestedBinary.getFullPathName() }.toVar());
@@ -59,7 +58,6 @@ int main()
     assert(migrated.activePlugin.resolve(paths) == bundle);
     assert(migrated.startupMode == "restoreLast");
     assert(migrated.plugins[0].state == "c3RhdGU=");
-    assert(migrated.fullscreen);
     assert(!migrated.scanOnStartup);
     assert(migrated.scanTimeoutSeconds == 20);
 
@@ -74,10 +72,29 @@ int main()
     assert(current.plugins[0].location.resolve(paths) == bundle);
     assert(current.plugins[0].canonicalPath.equalsIgnoreCase(canonicalPath(bundle)));
     assert(current.activePlugin.resolve(paths) == bundle);
+    assert(current.rack.size() == 1);
+    assert(current.rack[0].plugin.resolve(paths) == bundle);
+    auto rackSettings = current;
+    rackSettings.rack.clear();
+    rackSettings.rack.add({ PathReference::fromFile(bundle, paths), "c2xvdC0x", true, false, 540 });
+    rackSettings.rack.add({ PathReference::fromFile(bundle, paths), "c2xvdC0y", false, true, 720 });
+    rackSettings.openRackOnStartup = true;
+    assert(ConfigStore(paths).save(rackSettings));
+    const auto rackRoundTrip = ConfigStore(paths).load();
+    assert(rackRoundTrip.rack.size() == 2);
+    assert(rackRoundTrip.rack[0].state == "c2xvdC0x");
+    assert(rackRoundTrip.rack[1].state == "c2xvdC0y");
+    assert(rackRoundTrip.rack[0].muted && !rackRoundTrip.rack[0].solo);
+    assert(!rackRoundTrip.rack[1].muted && rackRoundTrip.rack[1].solo);
+    assert(rackRoundTrip.rack[0].editorHeight == 540 && rackRoundTrip.rack[1].editorHeight == 720);
+    assert(rackRoundTrip.openRackOnStartup);
     assert((comfortableWindowPhysicalSize({ 1920, 1080 }) == std::array<int, 2>({ 1280, 720 })));
     assert((comfortableWindowPhysicalSize({ 2560, 1440 }) == std::array<int, 2>({ 1920, 1080 })));
     assert((comfortableWindowPhysicalSize({ 3840, 2160 }) == std::array<int, 2>({ 2560, 1440 })));
     assert((comfortableWindowPhysicalSize({ 3440, 1440 }) == std::array<int, 2>({ 2580, 1080 })));
+    assert(!rackNeedsPreparation(true, 48000.0, 2, 512, 48000.0, 2, 512));
+    assert(rackNeedsPreparation(false, 48000.0, 2, 512, 48000.0, 2, 512));
+    assert(rackNeedsPreparation(true, 48000.0, 2, 512, 96000.0, 2, 512));
     assert(currentArchitecture() == (sizeof(void*) == 8 ? Architecture::x64 : Architecture::x86));
     assert(sizeof(VST3BridgeIpcSlot) == 40);
     assert(offsetof(VST3BridgeIpcSlot, sequence) == 32);

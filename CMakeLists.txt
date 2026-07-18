@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(AIMP_VST3_Bridge VERSION 2.0.0 LANGUAGES CXX C RC)
+project(AIMP_VST3_Rack VERSION 2.0.0 LANGUAGES CXX C RC)
 
 message(STATUS "Building against AIMP SDK v5.40 build 2650")
 
@@ -61,44 +61,44 @@ endfunction()
 
 # Winamp-compatible DSP module: this is the audio processor AIMP should list
 # in the "Plugins DSP" selector.
-add_library(dsp_vst3_audio SHARED
+add_library(dsp_vst3_rack SHARED
     Source/dsp_vst3_main.cpp
     Source/OutProcClient.cpp
     Source/BridgeRuntime.cpp
     Source/dsp_vst3.rc
 )
-set_target_properties(dsp_vst3_audio PROPERTIES PREFIX "" SUFFIX ".dll" OUTPUT_NAME "dsp_vst3_bridge")
-target_compile_definitions(dsp_vst3_audio PRIVATE
+set_target_properties(dsp_vst3_rack PROPERTIES PREFIX "" SUFFIX ".dll" OUTPUT_NAME "dsp_vst3_rack")
+target_compile_definitions(dsp_vst3_rack PRIVATE
     AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN=0
     AIMP_VST3_BRIDGE_ENABLE_WINAMP_DSP=1
     AIMP_VST3_BRIDGE_OUT_OF_PROCESS=1
 )
-target_include_directories(dsp_vst3_audio PRIVATE Source)
-target_link_libraries(dsp_vst3_audio PRIVATE juce::juce_core)
+target_include_directories(dsp_vst3_rack PRIVATE Source)
+target_link_libraries(dsp_vst3_rack PRIVATE juce::juce_core)
 
-add_executable(VST3BridgeHost WIN32
+add_executable(VST3RackHost WIN32
     Source/OutProcHostMain.cpp
     Source/VST3HostEngine.cpp
     Source/HostWindow.cpp
     Source/BridgeRuntime.cpp
     Source/VST3Bridge.manifest
 )
-configure_juce_target(VST3BridgeHost 0 0)
+configure_juce_target(VST3RackHost 0 0)
 
-add_executable(VST3BridgeScanner WIN32
+add_executable(VST3RackScanner WIN32
     Source/ScannerMain.cpp
     Source/BridgeRuntime.cpp
     Source/VST3Bridge.manifest
 )
-configure_juce_target(VST3BridgeScanner 0 0)
+configure_juce_target(VST3RackScanner 0 0)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(BRIDGE_ARCH_SUFFIX 64)
 else()
     set(BRIDGE_ARCH_SUFFIX 32)
 endif()
-set_target_properties(VST3BridgeHost PROPERTIES OUTPUT_NAME "VST3BridgeHost${BRIDGE_ARCH_SUFFIX}")
-set_target_properties(VST3BridgeScanner PROPERTIES OUTPUT_NAME "VST3BridgeScanner${BRIDGE_ARCH_SUFFIX}")
+set_target_properties(VST3RackHost PROPERTIES OUTPUT_NAME "VST3RackHost${BRIDGE_ARCH_SUFFIX}")
+set_target_properties(VST3RackScanner PROPERTIES OUTPUT_NAME "VST3RackScanner${BRIDGE_ARCH_SUFFIX}")
 
 enable_testing()
 add_executable(BridgeRuntimeTests

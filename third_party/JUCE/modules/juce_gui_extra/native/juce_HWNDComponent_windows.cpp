@@ -68,6 +68,18 @@ public:
 
             SetWindowPos (hwnd, nullptr, area.getX(), area.getY(), area.getWidth(), area.getHeight(), flagsToSend);
 
+            auto visible = owner.getLocalBounds();
+            auto* child = &owner;
+            for (auto* parent = child->getParentComponent(); parent != nullptr;
+                 child = parent, parent = parent->getParentComponent())
+                visible = parent->getLocalArea (child, visible).getIntersection (parent->getLocalBounds());
+
+            const auto clip = (owner.getLocalArea (child, visible).toFloat() * peer->getPlatformScaleFactor())
+                                  .getSmallestIntegerContainer();
+            auto region = CreateRectRgn (clip.getX(), clip.getY(), clip.getRight(), clip.getBottom());
+            if (SetWindowRgn (hwnd, region, TRUE) == 0)
+                DeleteObject (region);
+
             invalidateHWNDAndChildren();
         }
     }

@@ -5,6 +5,7 @@
 #include <juce_data_structures/juce_data_structures.h>
 #include <atomic>
 #include <functional>
+#include <vector>
 
 #include "BridgeRuntime.h"
 
@@ -21,11 +22,26 @@ public:
     bool loadPlugin(const juce::String& path, bool restoreSavedState = true);
     bool loadPluginFromFile(const juce::File& pluginFile);
     void unloadPlugin();
+    bool cloneRackSlot(int index, int insertAt);
+    void removeRackSlot(int index);
+    void clearRack();
+    void moveRackSlot(int from, int to);
+    void selectRackSlot(int index);
+    int getSelectedRackSlot() const { return selectedRackSlot; }
+    int getRackSize() const { return static_cast<int>(rackInstances.size()); }
+    juce::StringArray getRackPluginPaths() const;
+    juce::AudioPluginInstance* getRackPluginInstance(int index) const;
+    bool isRackSlotMuted(int index) const;
+    bool isRackSlotSolo(int index) const;
+    int getRackSlotEditorHeight(int index) const;
+    void setRackSlotMuted(int index, bool muted);
+    void setRackSlotSolo(int index, bool solo);
+    void setRackSlotEditorHeight(int index, int height);
     
     int processAudio(void* samples, int numFrames, int bps, int numChannels, int sampleRate);
     
-    bool hasActivePlugin() const { return pluginInstance != nullptr; }
-    juce::AudioPluginInstance* getPluginInstance() const { return pluginInstance.get(); }
+    bool hasActivePlugin() const { return !rackInstances.empty(); }
+    juce::AudioPluginInstance* getPluginInstance() const { return pluginInstance; }
     juce::String getActivePluginPath() const { return activePluginPath; }
     bool hasPendingPluginState() const { return !pendingPluginState.isEmpty(); }
     juce::uint32 getEditorStateRevision() const { return editorStateRevision.load(); }
@@ -86,7 +102,17 @@ public:
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList pluginList;
     
-    std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
+    struct RackInstance
+    {
+        juce::String path;
+        std::unique_ptr<juce::AudioPluginInstance> plugin;
+        bool muted = false;
+        bool solo = false;
+        int editorHeight = 0;
+    };
+    std::vector<RackInstance> rackInstances;
+    juce::AudioPluginInstance* pluginInstance = nullptr;
+    int selectedRackSlot = -1;
     juce::String activePluginPath;
     juce::String startupWarning;
     bool preserveRecoveredState = false;

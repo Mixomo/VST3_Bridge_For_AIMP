@@ -9,7 +9,8 @@
 
 namespace bridge
 {
-constexpr int configSchemaVersion = 7;
+constexpr int configSchemaVersion = 9;
+constexpr int maxRackSlots = 10;
 constexpr const char* bridgeVersion = "2.0.0";
 constexpr const char* aimpSdkVersion = "5.40 build 2650";
 
@@ -87,6 +88,15 @@ struct PluginRecord
     juce::String state;
 };
 
+struct RackSlot
+{
+    PathReference plugin;
+    juce::String state;
+    bool muted = false;
+    bool solo = false;
+    int editorHeight = 0;
+};
+
 struct BridgeSettings
 {
     StorageMode requestedStorageMode = StorageMode::automatic;
@@ -94,21 +104,15 @@ struct BridgeSettings
     PathReference activePlugin;
     juce::String pluginState;
     bool scanOnStartup = false;
+    bool openRackOnStartup = false;
     bool scanBridgeFolder = true;
     bool scanSystemFolders = false;
     bool removeMissing = true;
     bool retryQuarantined = false;
     int scanTimeoutSeconds = 20;
-    bool openEditorOnStart = false;
-    bool visualizerMode = false;
-    bool alwaysOnTop = false;
-    bool fullscreen = false;
-    bool rememberWindow = true;
-    std::array<int, 4> logicalWindowBounds { 80, 80, 1100, 700 };
-    int savedDpi = 96;
-    juce::String monitorName;
     juce::Array<ScanFolder> scanFolders;
     juce::Array<PluginRecord> plugins;
+    juce::Array<RackSlot> rack;
 };
 
 class ConfigStore
@@ -132,5 +136,7 @@ juce::String fingerprintBundle(const juce::File& bundle);
 juce::String canonicalPath(const juce::File& file);
 juce::File vst3BundleRoot(juce::File file);
 std::array<int, 2> comfortableWindowPhysicalSize(std::array<int, 2> displaySize);
+bool rackNeedsPreparation(bool prepared, double currentSampleRate, int currentChannels, int currentBlockSize,
+                          double sampleRate, int channels, int blockSize);
 juce::String makeInstanceId(const juce::File& packageRoot);
 }
