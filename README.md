@@ -34,8 +34,8 @@ dsp_vst3_rack/
 |-- bin/VST3RackHost64.exe
 |-- bin/VST3RackScanner32.exe
 |-- bin/VST3RackScanner64.exe
-|-- x86/dsp_vst3_rack.dll
-`-- x64/dsp_vst3_rack.dll
+|-- dsp_vst3_rack.dll        (x86)
+`-- x64/dsp_vst3_rack.dll    (x64)
 ```
 
 Portable VST3 bundles may be placed in `dsp_vst3_rack\VST3`. Other locations are added from **Scan Folders**. Discovery is manual for stability purposes; opening AIMP or the rack does not start a scan.
