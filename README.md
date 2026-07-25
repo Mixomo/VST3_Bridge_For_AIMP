@@ -33,8 +33,8 @@ The combined package contains:
 
 ```text
 dsp_vst3_bridge/
-|-- x64/dsp_vst3_bridge.dll
-|-- x86/dsp_vst3_bridge.dll
+|-- dsp_vst3_bridge.dll        (x86)
+|-- x64/dsp_vst3_bridge.dll    (x64)
 |-- bin/VST3BridgeHost64.exe
 |-- bin/VST3BridgeHost32.exe
 |-- bin/VST3BridgeScanner64.exe
