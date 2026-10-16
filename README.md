@@ -10,6 +10,7 @@ VST3 Bridge for AIMP hosts a VST3 effect in AIMP's DSP pipeline, including ASIO 
 
 - AIMP SDK v5.40 build 2650 integration.
 - One active VST3 effect at a time, with asynchronous shared-memory audio IPC.
+- 512-frame audio quanta with timestamped wet/dry alignment; sample-rate and channel changes invalidate stale host responses.
 - Native x86 and x64 AIMP DLLs, hosts and scanners in one package.
 - Mixed-bitness hosting: either AIMP architecture can restart the isolated x86 or x64 host required by the selected plug-in.
 - Manual discovery in the bridge package, its `VST3` folder, custom folders and optional standard-system folders.
@@ -23,7 +24,14 @@ VST3 Bridge for AIMP hosts a VST3 effect in AIMP's DSP pipeline, including ASIO 
 - Generic visualizer and fullscreen modes, always-on-top and remembered window geometry per bridge installation.
 - Separate parameter/state and window-size resets. Window sizing is monitor-, aspect-ratio- and DPI-aware and remains a manual action, so switching VST3 plug-ins does not overwrite the user's persisted geometry.
 - Per-Monitor DPI Awareness manifests for all hosts and scanners. JUCE handles live per-monitor scale changes and forwards supported VST3 editor scaling/resizing requests.
-- Per-installation, per-architecture and per-process logs in `%TEMP%`.
+- Asynchronous safe-mode host restart from Settings, preserving the saved plug-in selection and state without creating diagnostic files.
+
+### Changelog — 2026-10-16 | 3.0.1
+
+- **Audio transport:** Improved out-of-process audio handling with audio quantums, wet/dry alignment, and stale-block invalidation when the audio format changes.
+- **Host recovery:** Added **Reload Bridge** to the main window. It restarts the isolated host in safe bypass without blocking the GUI or audio callback. **Reload Plugin** is available under **Plugin Actions...**.
+- **Build and packaging:** Added `build.bat` to build both x86 and x64, run tests, and generate the AIMP package.
+- **Documentation:** Documented the recovery controls and possible external causes of audio artifacts.
 
 ## Install
 
@@ -66,7 +74,9 @@ Each dropdown entry can contain the plug-in name, company, category, architectur
 
 **Scan Folders...** opens the manual discovery window. Search locations can be added, enabled and scanned from there. Opening this window does not start a scan.
 
-**Plugin Actions...** opens operations for the currently selected entry. Parameter reset, size reset, retry, file location and removal are kept here so they cannot be triggered accidentally.
+**Reload Bridge** asynchronously restarts the isolated host in safe bypass. The saved plug-in selection and state are preserved, but the plug-in is not loaded automatically; select it again after recovery.
+
+**Plugin Actions...** opens operations for the selected entry, including **Reload Plugin**. Parameter reset, size reset, retry, file location and removal are kept here so they cannot be triggered accidentally.
 
 **Settings...** opens configuration storage, startup, discovery, window, maintenance and diagnostic options. The Settings and bridge windows remain independent and can be moved, resized and focused separately.
 
@@ -84,7 +94,9 @@ The native title bar provides **Minimise**, **Maximise/Restore** and **Close**. 
 
 ### Plugin Actions
 
-**Plugin Actions...** applies only to the selected VST3. Actions that require a running instance are enabled only for the active plug-in.
+**Reload Plugin** saves the active VST3 state, then unloads and reloads it with that state restored. It is enabled only while a plug-in is active.
+
+**Reload Bridge** restarts the isolated host asynchronously without blocking AIMP's audio callback or GUI. The replacement starts in bypass rather than automatically reloading the VST3 that may have caused the problem. Its saved selection and state are preserved; select the plug-in again after recovery. The bridge GUI must remain responsive to use this action. If a plug-in has frozen the GUI too, disable and re-enable the DSP in AIMP.
 
 **Retry and reset quarantine** appears for a failed, timed-out or quarantined entry. It clears that entry's scan and runtime failure flags, scans it again in isolation and loads it only if the new validation succeeds.
 
@@ -163,10 +175,6 @@ If startup recovery cannot safely restore the previous configuration or helper, 
 
 #### Maintenance And Diagnostics
 
-**Open Log** opens the diagnostic log for the current bridge process in the associated text editor.
-
-**Open Log Folder** opens the Windows temporary directory containing the current log.
-
 **Open Config Folder** opens the directory containing the active JSON configuration. Its location follows the selected Automatic, Portable or User profile storage mode.
 
 **Copy Diagnostics** copies bridge version, architecture, paths, DPI, window state, plug-in status and quarantine counts to the clipboard. Opaque Base64 VST3 state is intentionally omitted.
@@ -202,8 +210,10 @@ Requirements: Windows 10/11, Visual Studio 2022 C++ desktop workload, CMake 3.22
 Build, test, validate manifests and package both architectures. The script stops on the first CMake, compiler or test failure and will not package stale binaries:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-All.ps1
+.\build.bat
 ```
+
+Pass `Debug` as the first argument to build the Debug configuration; Release is the default.
 
 For one architecture only:
 
@@ -215,11 +225,7 @@ ctest --test-dir build_x64 -C Release --output-on-failure
 
 ## Diagnostics
 
-Settings provides **Open Log**, **Open Log Folder**, **Copy Diagnostics**, and **Reset Scan Cache**. Logs use names similar to:
-
-```text
-%TEMP%\dsp_vst3_bridge_<instance>_x64_<pid>.log
-```
+Settings provides **Open Config Folder**, **Copy Diagnostics**, and **Reset Scan Cache**. The main bridge window provides **Reload Bridge** for safe host recovery. The bridge does not write diagnostic logs or watchdog files to disk; diagnostic messages are available through the Windows debugger. Scanner result files are transient and are created beside the active configuration, not in `%TEMP%`.
 
 Diagnostics omit the Base64 VST3 state. A failed or frozen scanner is terminated independently. A runtime plug-in failure immediately leaves the audio path in dry bypass.
 
@@ -235,10 +241,13 @@ At runtime the DLL performs this check in an isolated process. Failure or timeou
 
 ## Limitations
 
+> [!NOTE]
+> Audio cracks, pops, clicks, and stutters may occur during playback, especially when using audio devices in ASIO mode. These issues are external to the VST3 Bridge and can occur even when the bridge is disabled or no VST3 is loaded. They depend on factors such as your computer's CPU, audio device, sample rate and buffer size, as well as software-related factors including GPU drivers and background operating-system processes. On Windows, you can use [LatencyMon](https://www.resplendence.com/latencymon) to check which system components contribute most to latency.
+
 - Universal VST3 compatibility is not possible; some plug-ins assume DAW transport, MIDI, sidechains, licensing services or host-specific behavior.
 - Legacy system-DPI editors can remain imperfect on mixed-DPI systems. The bridge does not bitmap-stretch them; scale-aware VST3/JUCE editors behave best.
 - A host can preserve and restore only state that the VST3 serialises. Plug-in-specific GUI scale or external resources that are omitted from VST3 state remain the plug-in's responsibility.
-- A two-block asynchronous pipeline adds latency so AIMP's audio callback never waits for another process.
+- The asynchronous pipeline uses two transport quantums sized for the greater of 512 frames, about 10 ms at the current sample rate, or the largest callback observed (up to 65,536 frames). This provides at least 1024 samples of baseline latency at 44.1 kHz, plus the VST3's reported processing latency, so AIMP's audio callback never waits for another process. Dry bypass is aligned to that timeline.
 - Very high CPU/DPC latency can still starve AIMP or the isolated host; bypass protects continuity but cannot create CPU time.
 - Physical mixed-monitor, unusual GPU/WebView editor and commercial licensing behavior must be validated on the target system.
 - Plug-in files, licenses and external services are not made portable by storing bridge paths relatively.

@@ -31,6 +31,7 @@ private:
     void updatePluginList();
     void clearEditorComponent();
     void refreshEditorComponent();
+    void reloadActivePlugin();
     void resetPluginParameters();
     void resetEditorSize();
     void openFolderManager();
@@ -38,6 +39,7 @@ private:
     juce::Label pluginLabel;
     juce::ComboBox pluginComboBox;
     juce::TextButton loadButton { "Load VST..." };
+    juce::TextButton restartEngineButton { "Reload Bridge" };
     juce::TextButton foldersButton { "Scan Folders..." };
     juce::TextButton removeButton { "Plugin Actions..." };
     juce::TextButton settingsButton { "Settings..." };

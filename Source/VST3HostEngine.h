@@ -4,6 +4,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_data_structures/juce_data_structures.h>
 #include <atomic>
+#include <array>
 #include <functional>
 
 #include "BridgeRuntime.h"
@@ -23,6 +24,14 @@ public:
     void unloadPlugin();
     
     int processAudio(void* samples, int numFrames, int bps, int numChannels, int sampleRate);
+    bool wasLastAudioBlockProcessed() const
+    {
+        return lastAudioBlockProcessed.load(std::memory_order_acquire);
+    }
+    std::uint32_t getPluginLatencySamples() const
+    {
+        return pluginLatencySamples.load(std::memory_order_acquire);
+    }
     
     bool hasActivePlugin() const { return pluginInstance != nullptr; }
     juce::AudioPluginInstance* getPluginInstance() const { return pluginInstance.get(); }
@@ -58,6 +67,8 @@ public:
     void forgetAllPlugins();
     juce::String getDiagnostics() const;
     void setHostArchitectureRequester(std::function<void(bridge::Architecture)> callback);
+    void setSafeHostRestartRequester(std::function<bool()> callback);
+    bool requestSafeHostRestart();
     void requestHostArchitecture(const bridge::PluginRecord& plugin);
 
     // AudioProcessorListener callbacks
@@ -75,8 +86,10 @@ public:
     ~VST3HostEngine() override;
 
     bool preparePlugin(double sampleRate, int numChannels, int blockSize);
+    void formatChangeLoop();
+    void requestFormatPreparation(int sampleRate, int numChannels, int blockSize, bool force = false);
+    void stopFormatPreparation();
     juce::File getConfigFile() const;
-    juce::File getLogFile() const;
     void writeLog(const juce::String& message) const;
 
     void* dllInstance = nullptr;
@@ -96,14 +109,16 @@ public:
     double currentSampleRate = 0.0;
     int currentNumChannels = 0;
     int currentBlockSize = 0;
-    bool pluginPrepared = false;
+    std::atomic<bool> pluginPrepared { false };
+    std::atomic<bool> lastAudioBlockProcessed { false };
+    std::atomic<std::uint32_t> pluginLatencySamples { 0 };
     bool useDoublePrecision = false;
     int64_t processedSamples = 0;
     int lastLoggedLatency = -1;
     int processLogCountdown = 0;
-    bool smoothNextProcessedBlock = false;
-    bool hasOutputTail = false;
-    juce::Array<double> lastOutputTail;
+    std::atomic<bool> smoothNextProcessedBlock { false };
+    std::atomic<bool> hasOutputTail { false };
+    std::array<double, 64> lastOutputTail {};
     std::atomic<int> lockMissCount { 0 };
     std::atomic<int> smoothedBypassCount { 0 };
     std::atomic<int> slowBlockCount { 0 };
@@ -113,6 +128,24 @@ public:
     std::atomic<int> maxOutputMilliAbs { 0 };
     std::atomic<juce::uint32> stateDirtyAt { 0 };
     std::atomic<juce::uint32> editorStateRevision { 0 };
+    std::atomic<int> requestedSampleRate { 0 };
+    std::atomic<int> requestedNumChannels { 0 };
+    std::atomic<int> requestedBlockSize { 0 };
+    std::atomic<std::uint32_t> requestedFormatRevision { 0 };
+    std::atomic<bool> formatWorkerStopping { false };
+    class FormatPreparationThread : public juce::Thread
+    {
+    public:
+        explicit FormatPreparationThread(VST3HostEngine& engine);
+        void run() override;
+    private:
+        VST3HostEngine& engine;
+    };
+    std::unique_ptr<FormatPreparationThread> formatWorker;
+    int pendingFormatSampleRate = 0;
+    int pendingFormatNumChannels = 0;
+    int pendingFormatBlockSize = 0;
+    std::uint32_t pendingFormatRevision = 0;
 
     class SyntheticPlayHead : public juce::AudioPlayHead
     {
@@ -126,6 +159,8 @@ public:
     };
     
     juce::CriticalSection processLock;
+    juce::CriticalSection formatRequestLock;
+    juce::CriticalSection formatWorkerLifecycleLock;
     juce::AudioBuffer<float> floatBuffer;
     juce::AudioBuffer<double> doubleBuffer;
     juce::MidiBuffer midiBuffer;
@@ -159,6 +194,9 @@ public:
     juce::String scanSummary;
     juce::StringArray scanIssues;
     std::function<void(bridge::Architecture)> hostArchitectureRequester;
+    std::function<bool()> safeHostRestartRequester;
+    juce::CriticalSection pluginCatalogLifecycleLock;
+    std::atomic<std::uint64_t> pluginCatalogRevision { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VST3HostEngine)
 };

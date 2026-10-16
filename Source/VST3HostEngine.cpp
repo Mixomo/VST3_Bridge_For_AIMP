@@ -5,6 +5,7 @@
 #include <juce_core/juce_core.h>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <vector>
 
 // Raw pointer — no destructor fires at DLL_PROCESS_DETACH.
@@ -14,6 +15,7 @@ static VST3HostEngine* s_instance = nullptr;
 
 namespace
 {
+    constexpr int maxRealtimeBlockFrames = 32768;
     std::vector<std::unique_ptr<juce::AudioPluginInstance>>& getRetiredPlugins()
     {
         // Intentionally leaked for process lifetime. Some commercial VST3s keep
@@ -198,6 +200,16 @@ VST3HostEngine::~VST3HostEngine()
     shutdown();
 }
 
+VST3HostEngine::FormatPreparationThread::FormatPreparationThread(VST3HostEngine& engineIn)
+    : juce::Thread("VST3 format preparation"), engine(engineIn)
+{
+}
+
+void VST3HostEngine::FormatPreparationThread::run()
+{
+    engine.formatChangeLoop();
+}
+
 void VST3HostEngine::init(void* hInst, const bridge::RuntimePaths& paths, bool restorePlugin)
 {
     dllInstance = hInst;
@@ -213,10 +225,17 @@ void VST3HostEngine::init(void* hInst, const bridge::RuntimePaths& paths, bool r
         formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
     
     loadState(restorePlugin);
+    formatWorker = std::make_unique<FormatPreparationThread>(*this);
+    if (!formatWorker->startThread())
+    {
+        formatWorker.reset();
+        writeLog("Failed to start VST3 format preparation thread; sample-rate changes will remain bypassed");
+    }
 }
 
 void VST3HostEngine::shutdown()
 {
+    stopFormatPreparation();
     cancelScan();
     if (scanThread != nullptr)
     {
@@ -321,7 +340,8 @@ bool VST3HostEngine::loadPlugin(const juce::String& path, bool restoreSavedState
         
         if (currentSampleRate > 0.0 && currentNumChannels > 0)
         {
-            preparePlugin(currentSampleRate, currentNumChannels, currentBlockSize > 0 ? currentBlockSize : 512);
+            requestFormatPreparation(static_cast<int>(currentSampleRate), currentNumChannels,
+                                     currentBlockSize > 0 ? currentBlockSize : 512, true);
         }
         
         return true;
@@ -508,6 +528,8 @@ void VST3HostEngine::unloadPlugin()
     }
     activePluginPath = "";
     pluginPrepared = false;
+    lastAudioBlockProcessed.store(false, std::memory_order_release);
+    pluginLatencySamples.store(0, std::memory_order_release);
     useDoublePrecision = false;
     playHead.reset();
     processedSamples = 0;
@@ -515,6 +537,7 @@ void VST3HostEngine::unloadPlugin()
 
 int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numChannels, int sampleRate)
 {
+    lastAudioBlockProcessed.store(false, std::memory_order_release);
     juce::ScopedNoDenormals noDenormals;
 
     if (samples == nullptr || numFrames <= 0 || numChannels <= 0 || sampleRate <= 0)
@@ -531,18 +554,18 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
 
     auto updateOutputTail = [&]()
     {
-        lastOutputTail.clearQuick();
+        if (numChannels > 64) return;
         for (int c = 0; c < numChannels; ++c)
         {
             const auto sampleIndex = (numFrames - 1) * numChannels + c;
-            lastOutputTail.add(readInterleavedSample(samples, bytes, bps, sampleIndex));
+            lastOutputTail[static_cast<std::size_t>(c)] = readInterleavedSample(samples, bytes, bps, sampleIndex);
         }
-        hasOutputTail = true;
+        hasOutputTail.store(true, std::memory_order_release);
     };
 
     auto smoothBlockStartFromTail = [&]()
     {
-        if (!hasOutputTail || lastOutputTail.size() < numChannels)
+        if (!hasOutputTail.load(std::memory_order_acquire) || numChannels > static_cast<int>(lastOutputTail.size()))
             return;
 
         constexpr int smoothingSamples = 64;
@@ -563,12 +586,22 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         }
     };
 
+    if (numFrames > maxRealtimeBlockFrames || numChannels > 64)
+    {
+        smoothNextProcessedBlock.store(true, std::memory_order_release);
+        ++smoothedBypassCount;
+        return numFrames;
+    }
+
+    if (sampleRate != requestedSampleRate.load(std::memory_order_acquire)
+        || numChannels != requestedNumChannels.load(std::memory_order_acquire)
+        || numFrames > requestedBlockSize.load(std::memory_order_acquire))
+        requestFormatPreparation(sampleRate, numChannels, numFrames);
+
     const juce::ScopedTryLock sl(processLock);
     if (!sl.isLocked())
     {
-        smoothBlockStartFromTail();
-        updateOutputTail();
-        smoothNextProcessedBlock = true;
+        smoothNextProcessedBlock.store(true, std::memory_order_release);
         ++lockMissCount;
         ++smoothedBypassCount;
         return numFrames;
@@ -577,19 +610,25 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     if (pluginInstance == nullptr)
         return numFrames;
     
-    // Check if format changed and re-prepare if necessary
-    if (sampleRate != currentSampleRate || numChannels != currentNumChannels || numFrames > currentBlockSize)
+    if (!pluginPrepared.load(std::memory_order_acquire)
+        || sampleRate != currentSampleRate || numChannels != currentNumChannels || numFrames > currentBlockSize)
     {
-        pluginPrepared = preparePlugin(sampleRate, numChannels, numFrames);
-    }
-
-    if (!pluginPrepared)
+        smoothBlockStartFromTail();
+        updateOutputTail();
+        smoothNextProcessedBlock.store(true, std::memory_order_release);
+        ++smoothedBypassCount;
         return numFrames;
+    }
 
     playHead.update(sampleRate, numFrames, processedSamples);
     if (useDoublePrecision)
     {
-        doubleBuffer.setSize(numChannels, numFrames, false, false, true);
+        if (doubleBuffer.getNumChannels() != numChannels || doubleBuffer.getNumSamples() < numFrames)
+        {
+            smoothBlockStartFromTail(); updateOutputTail();
+            smoothNextProcessedBlock.store(true, std::memory_order_release);
+            return numFrames;
+        }
 
         for (int c = 0; c < numChannels; ++c)
         {
@@ -619,7 +658,6 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
 
         midiBuffer.clear();
         {
-            const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
             if (pluginInstance->isSuspended())
                 return numFrames;
 
@@ -669,7 +707,12 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     }
     else
     {
-        floatBuffer.setSize(numChannels, numFrames, false, false, true);
+        if (floatBuffer.getNumChannels() != numChannels || floatBuffer.getNumSamples() < numFrames)
+        {
+            smoothBlockStartFromTail(); updateOutputTail();
+            smoothNextProcessedBlock.store(true, std::memory_order_release);
+            return numFrames;
+        }
 
         for (int c = 0; c < numChannels; ++c)
         {
@@ -699,7 +742,6 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
 
         midiBuffer.clear();
         {
-            const juce::ScopedLock callbackLock(pluginInstance->getCallbackLock());
             if (pluginInstance->isSuspended())
                 return numFrames;
 
@@ -751,10 +793,9 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         }
     }
 
-    if (smoothNextProcessedBlock)
+    if (smoothNextProcessedBlock.exchange(false, std::memory_order_acq_rel))
     {
         smoothBlockStartFromTail();
-        smoothNextProcessedBlock = false;
     }
 
     updateOutputTail();
@@ -764,6 +805,9 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     if (blockNonFiniteSamples > 0)
         nonFiniteOutputSamples.fetch_add(blockNonFiniteSamples, std::memory_order_relaxed);
     updateAtomicMax(maxOutputMilliAbs, blockMaxMilliAbs);
+    pluginLatencySamples.store(static_cast<std::uint32_t>(
+        juce::jmax(0, pluginInstance->getLatencySamples())), std::memory_order_release);
+    lastAudioBlockProcessed.store(true, std::memory_order_release);
 
     const auto elapsedTicks = juce::Time::getHighResolutionTicks() - callbackStartTicks;
     const auto elapsedMicros = static_cast<int>(elapsedTicks * 1000000 / juce::Time::getHighResolutionTicksPerSecond());
@@ -782,7 +826,6 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
     currentNumChannels = numChannels;
     currentBlockSize = juce::jmax(1, blockSize);
     pluginPrepared = false;
-    lastOutputTail.ensureStorageAllocated(numChannels);
     
     if (pluginInstance == nullptr)
         return false;
@@ -826,10 +869,14 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
     }
 
     pluginInstance->setRateAndBufferSizeDetails(sampleRate, currentBlockSize);
+    floatBuffer.setSize(numChannels, currentBlockSize, false, false, true);
+    doubleBuffer.setSize(numChannels, currentBlockSize, false, false, true);
+    midiBuffer.ensureSize(2048);
     pluginInstance->prepareToPlay(sampleRate, currentBlockSize);
     pluginPrepared = true;
-    processLogCountdown = 8;
     processedSamples = 0;
+    smoothNextProcessedBlock.store(true, std::memory_order_release);
+    processLogCountdown = 8;
 
     writeLog("Prepare complete: inputs=" + juce::String(pluginInstance->getTotalNumInputChannels())
              + " outputs=" + juce::String(pluginInstance->getTotalNumOutputChannels())
@@ -840,22 +887,118 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
     return true;
 }
 
+void VST3HostEngine::requestFormatPreparation(int sampleRate, int numChannels, int blockSize, bool force)
+{
+    if (sampleRate <= 0 || numChannels <= 0 || blockSize <= 0
+        || blockSize > maxRealtimeBlockFrames || numChannels > 64)
+        return;
+
+    if (formatWorker == nullptr)
+        return;
+
+    const juce::ScopedLock lifecycleLock(formatWorkerLifecycleLock);
+    if (!force
+        && sampleRate == requestedSampleRate.load(std::memory_order_acquire)
+        && numChannels == requestedNumChannels.load(std::memory_order_acquire)
+        && blockSize <= requestedBlockSize.load(std::memory_order_acquire))
+        return;
+    requestedSampleRate.store(sampleRate, std::memory_order_release);
+    requestedNumChannels.store(numChannels, std::memory_order_release);
+    requestedBlockSize.store(blockSize, std::memory_order_release);
+    const auto revision = requestedFormatRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+    {
+        const juce::ScopedLock lock(formatRequestLock);
+        pendingFormatSampleRate = sampleRate;
+        pendingFormatNumChannels = numChannels;
+        pendingFormatBlockSize = blockSize;
+        pendingFormatRevision = revision;
+    }
+
+    formatWorker->notify();
+}
+
+void VST3HostEngine::formatChangeLoop()
+{
+    auto observedRevision = std::uint32_t { 0 };
+    while (!formatWorkerStopping.load(std::memory_order_acquire))
+    {
+        const auto revision = requestedFormatRevision.load(std::memory_order_acquire);
+        if (revision == 0 || revision == observedRevision)
+        {
+            formatWorker->wait(1000);
+            continue;
+        }
+
+        const juce::ScopedTryLock workerLock(processLock);
+        if (!workerLock.isLocked())
+        {
+            juce::Thread::sleep(1);
+            continue;
+        }
+
+        int rate = 0, channels = 0, frames = 0;
+        std::uint32_t requestRevision = 0;
+        {
+            const juce::ScopedLock requestLock(formatRequestLock);
+            rate = pendingFormatSampleRate;
+            channels = pendingFormatNumChannels;
+            frames = pendingFormatBlockSize;
+            requestRevision = pendingFormatRevision;
+        }
+        if (rate <= 0 || channels <= 0 || frames <= 0) continue;
+
+        try
+        {
+            if (pluginInstance != nullptr)
+                pluginPrepared.store(preparePlugin(rate, channels, frames), std::memory_order_release);
+            else
+            {
+                currentSampleRate = rate;
+                currentNumChannels = channels;
+                currentBlockSize = frames;
+                floatBuffer.setSize(channels, frames, false, false, true);
+                doubleBuffer.setSize(channels, frames, false, false, true);
+                pluginPrepared.store(false, std::memory_order_release);
+            }
+        }
+        catch (const std::exception& error)
+        {
+            pluginPrepared.store(false, std::memory_order_release);
+            writeLog("VST3 format preparation failed: " + juce::String(error.what()));
+        }
+        catch (...)
+        {
+            pluginPrepared.store(false, std::memory_order_release);
+            writeLog("VST3 format preparation failed with an unknown exception");
+        }
+        observedRevision = requestRevision;
+    }
+}
+
+void VST3HostEngine::stopFormatPreparation()
+{
+    const juce::ScopedLock lifecycleLock(formatWorkerLifecycleLock);
+    if (formatWorker == nullptr) return;
+    formatWorkerStopping.store(true, std::memory_order_release);
+    formatWorker->notify();
+    if (!formatWorker->stopThread(2000))
+    {
+        writeLog("VST3 format preparation thread did not stop within 2 seconds");
+        formatWorker->waitForThreadToExit(-1);
+    }
+    formatWorker.reset();
+}
+
 juce::File VST3HostEngine::getConfigFile() const
 {
     return runtimePaths.activeConfig;
 }
 
-juce::File VST3HostEngine::getLogFile() const
-{
-    return runtimePaths.logFile;
-}
-
 void VST3HostEngine::writeLog(const juce::String& message) const
 {
-    auto logFile = getLogFile();
-    auto timestamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d %H:%M:%S.");
-    auto millis = juce::String(juce::Time::getCurrentTime().getMilliseconds()).paddedLeft('0', 3);
-    logFile.appendText(timestamp + millis + " " + message + "\r\n", false, false, "\r\n");
+    const auto utf8 = message.toRawUTF8();
+    OutputDebugStringA(utf8);
+    OutputDebugStringA("\n");
 }
 
 void VST3HostEngine::saveState()
@@ -912,8 +1055,8 @@ void VST3HostEngine::loadState(bool restorePlugin)
     if (!restorePlugin)
     {
         preserveRecoveredState = true;
-        startupWarning = "The previous VST3 session failed its startup check. The bridge opened in bypass; your saved selection and state were preserved.";
-        writeLog("Safe startup enabled; previous plugin state preserved and bridge opened in bypass");
+        startupWarning = "The audio host restarted in safe mode. It opened in bypass; your saved VST3 selection and state were preserved.";
+        writeLog("Safe startup enabled; previous plugin selection and state preserved in bypass");
         return;
     }
 
@@ -1109,6 +1252,9 @@ void VST3HostEngine::resetActivePluginParameters()
 
 void VST3HostEngine::forgetAllPlugins()
 {
+    const juce::ScopedLock catalogLock(pluginCatalogLifecycleLock);
+    pluginCatalogRevision.fetch_add(1, std::memory_order_acq_rel);
+    cancelScan();
     unloadPlugin();
     {
         const juce::ScopedLock lock(stateLock);
@@ -1144,7 +1290,6 @@ juce::String VST3HostEngine::getDiagnostics() const
          << "Active plugin: " << (activePluginPath.isNotEmpty() ? activePluginPath : "[Bypass]") << "\r\n"
          << "Configuration: " << runtimePaths.activeConfig.getFullPathName() << "\r\n"
          << "Bridge root: " << runtimePaths.packageRoot.getFullPathName() << "\r\n"
-         << "Log: " << runtimePaths.logFile.getFullPathName() << "\r\n"
          << "Cached plugins: " << snapshot.plugins.size() << "\r\n"
          << "Scanner quarantine: " << scannerQuarantine << "; runtime quarantine: " << runtimeQuarantine << "\r\n";
     for (const auto& folder : snapshot.scanFolders)
@@ -1155,6 +1300,16 @@ juce::String VST3HostEngine::getDiagnostics() const
 void VST3HostEngine::setHostArchitectureRequester(std::function<void(bridge::Architecture)> callback)
 {
     hostArchitectureRequester = std::move(callback);
+}
+
+void VST3HostEngine::setSafeHostRestartRequester(std::function<bool()> callback)
+{
+    safeHostRestartRequester = std::move(callback);
+}
+
+bool VST3HostEngine::requestSafeHostRestart()
+{
+    return safeHostRestartRequester && safeHostRestartRequester();
 }
 
 void VST3HostEngine::requestHostArchitecture(const bridge::PluginRecord& plugin)
@@ -1173,6 +1328,7 @@ void VST3HostEngine::requestHostArchitecture(const bridge::PluginRecord& plugin)
 
 void VST3HostEngine::runScan(const juce::Array<juce::File>& files, bool force, const juce::File& loadAfterScan)
 {
+    const auto catalogRevision = pluginCatalogRevision.load(std::memory_order_acquire);
     scanDone = 0; scanTotal = files.size(); scanCompatible = 0; scanFailed = 0; scanTimedOut = 0;
     {
         const juce::ScopedLock lock(stateLock);
@@ -1206,6 +1362,8 @@ void VST3HostEngine::runScan(const juce::Array<juce::File>& files, bool force, c
             auto result = scanOne(bundle);
             {
                 const juce::ScopedLock lock(stateLock);
+                if (catalogRevision != pluginCatalogRevision.load(std::memory_order_acquire))
+                    break;
                 int index = -1;
                 for (int i = 0; i < settings.plugins.size(); ++i)
                     if (settings.plugins.getReference(i).canonicalPath.equalsIgnoreCase(canonical)) { index = i; break; }
@@ -1230,6 +1388,10 @@ void VST3HostEngine::runScan(const juce::Array<juce::File>& files, bool force, c
         loadSucceeded |= compatible && loadAfterScan != juce::File()
             && canonical.equalsIgnoreCase(bridge::canonicalPath(bridge::vst3BundleRoot(loadAfterScan)));
     }
+
+    const juce::ScopedLock catalogLock(pluginCatalogLifecycleLock);
+    if (catalogRevision != pluginCatalogRevision.load(std::memory_order_acquire))
+        return;
 
     {
         const juce::ScopedLock lock(stateLock);
@@ -1276,8 +1438,15 @@ bridge::PluginRecord VST3HostEngine::scanOne(const juce::File& file)
         return record;
     }
 
-    const auto resultFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getNonexistentChildFile("vst3_scan_" + juce::Uuid().toString(), ".json", false);
+    const auto resultDirectory = runtimePaths.activeConfig.getParentDirectory();
+    if (!resultDirectory.createDirectory())
+    {
+        record.status = "Scan failed";
+        record.lastError = "Could not create the configuration directory for the scanner result";
+        return record;
+    }
+    const auto resultFile = resultDirectory.getNonexistentChildFile(
+        "vst3_scan_" + juce::Uuid().toString(), ".json", false);
     juce::StringArray arguments { scanner.getFullPathName(), "--plugin", bundle.getFullPathName(),
                                   "--result", resultFile.getFullPathName() };
     juce::ChildProcess child;

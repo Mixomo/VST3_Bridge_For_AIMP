@@ -32,7 +32,6 @@ struct RuntimePaths
     juce::File portableConfig;
     juce::File userConfig;
     juce::File activeConfig;
-    juce::File logFile;
     StorageMode storageMode = StorageMode::automatic;
     bool portableFallback = false;
 

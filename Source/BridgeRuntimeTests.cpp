@@ -79,9 +79,12 @@ int main()
     assert((comfortableWindowPhysicalSize({ 3840, 2160 }) == std::array<int, 2>({ 2560, 1440 })));
     assert((comfortableWindowPhysicalSize({ 3440, 1440 }) == std::array<int, 2>({ 2580, 1080 })));
     assert(currentArchitecture() == (sizeof(void*) == 8 ? Architecture::x64 : Architecture::x86));
-    assert(sizeof(VST3BridgeIpcSlot) == 40);
+    assert(sizeof(VST3BridgeIpcSlot) == 64);
     assert(offsetof(VST3BridgeIpcSlot, sequence) == 32);
-    static_assert(sizeof(VST3BridgeIpcHeader) == 192);
+    static_assert(sizeof(VST3BridgeIpcHeader) == 384);
+    assert(VST3_BRIDGE_IPC_VERSION == 8);
+    VST3BridgeIpcHeader ipcHeader;
+    assert(ipcHeader.safeRestartRequested.load() == 0);
     root.deleteRecursively();
     std::cout << "BridgeRuntimeTests passed\n";
     return 0;

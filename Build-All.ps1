@@ -12,14 +12,14 @@ $x86 = Join-Path $root 'build_x86'
 
 cmake -S $root -B $x64 -G 'Visual Studio 17 2022' -A x64
 if ($LASTEXITCODE) { throw 'x64 CMake configuration failed' }
-cmake --build $x64 --config $Configuration --target dsp_vst3_audio VST3BridgeHost VST3BridgeScanner BridgeRuntimeTests
+cmake --build $x64 --config $Configuration --target dsp_vst3_audio VST3BridgeHost VST3BridgeScanner BridgeRuntimeTests OutProcAudioClientTests
 if ($LASTEXITCODE) { throw 'x64 build failed' }
 ctest --test-dir $x64 -C $Configuration --output-on-failure
 if ($LASTEXITCODE) { throw 'x64 tests failed' }
 
 cmake -S $root -B $x86 -G 'Visual Studio 17 2022' -A Win32
 if ($LASTEXITCODE) { throw 'x86 CMake configuration failed' }
-cmake --build $x86 --config $Configuration --target dsp_vst3_audio VST3BridgeHost VST3BridgeScanner BridgeRuntimeTests
+cmake --build $x86 --config $Configuration --target dsp_vst3_audio VST3BridgeHost VST3BridgeScanner BridgeRuntimeTests OutProcAudioClientTests
 if ($LASTEXITCODE) { throw 'x86 build failed' }
 ctest --test-dir $x86 -C $Configuration --output-on-failure
 if ($LASTEXITCODE) { throw 'x86 tests failed' }
@@ -38,7 +38,7 @@ foreach ($binary in @(
     (Join-Path $x64 "$Configuration\VST3BridgeScanner64.exe"),
     (Join-Path $x86 "$Configuration\VST3BridgeScanner32.exe")
 )) {
-    $manifest = [System.IO.Path]::GetTempFileName()
+    $manifest = "$binary.manifest.tmp"
     & $mt -nologo "-inputresource:$binary;#1" "-out:$manifest"
     if ($LASTEXITCODE -ne 0 -or -not (Select-String -LiteralPath $manifest -Pattern 'PerMonitorV2' -Quiet)) {
         throw "Per-Monitor V2 manifest validation failed: $binary"

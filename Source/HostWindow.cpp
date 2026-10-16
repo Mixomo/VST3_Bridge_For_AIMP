@@ -171,7 +171,8 @@ namespace
     class SettingsComponent final : public juce::Component, private juce::Button::Listener, private juce::ComboBox::Listener
     {
     public:
-        SettingsComponent()
+        explicit SettingsComponent(std::function<void()> forgetAllCallbackIn)
+            : forgetAllCallback(std::move(forgetAllCallbackIn))
         {
             settings = VST3HostEngine::getInstance().getSettingsSnapshot();
             storage.addItemList({ "Automatic", "Portable", "User profile" }, 1);
@@ -185,9 +186,7 @@ namespace
             configure(retryQuarantine, "Retry quarantined plugins automatically", settings.retryQuarantined);
             configure(autoEditor, "Open VST3 editor automatically when DSP starts", settings.openEditorOnStart);
             configure(rememberWindow, "Remember window position and size", settings.rememberWindow);
-            openLog.setButtonText("Open Log"); openLogFolder.setButtonText("Open Log Folder"); openConfigFolder.setButtonText("Open Config Folder"); copyDiagnostics.setButtonText("Copy Diagnostics"); resetCache.setButtonText("Reset Scan Cache"); forgetAll.setButtonText("Forget All Plugins");
-            openLog.setTooltip("Open the current diagnostic log in its associated text editor.");
-            openLogFolder.setTooltip("Open the Windows Temp folder containing the bridge diagnostic log.");
+            openConfigFolder.setButtonText("Open Config Folder"); copyDiagnostics.setButtonText("Copy Diagnostics"); resetCache.setButtonText("Reset Scan Cache"); forgetAll.setButtonText("Forget All Plugins");
             openConfigFolder.setTooltip("Open the folder containing the active JSON configuration file. The location follows the selected Automatic, Portable or User profile storage mode.");
             copyDiagnostics.setTooltip("Copy bridge version, architecture, DPI, paths, window state and plugin diagnostics to the clipboard.");
             resetCache.setTooltip("Invalidate cached scan fingerprints and clear scan/runtime quarantine flags. Remembered plugins, their saved states and scan folders are kept; no scan starts automatically.");
@@ -198,7 +197,7 @@ namespace
             retryQuarantine.setTooltip("Let a manual scan retry plugins previously isolated after a scan or runtime failure.");
             autoEditor.setTooltip("Ask the out-of-process host to show the bridge window when AIMP starts this DSP. If startup recovery fails, it opens safely in bypass.");
             rememberWindow.setTooltip("Restore bridge position, dimensions, monitor, DPI, visualizer/fullscreen state and always-on-top preference. Switching plugins does not force a new bridge size.");
-            for (auto* button : { &openLog, &openLogFolder, &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll }) { button->addListener(this); addAndMakeVisible(button); }
+            for (auto* button : { &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll }) { button->addListener(this); addAndMakeVisible(button); }
             timeout.setRange(1, 120, 1); timeout.setValue(settings.scanTimeoutSeconds); timeout.setTextValueSuffix(" seconds scan timeout");
             for (auto* c : std::initializer_list<juce::Component*> { &storageLabel, &storage, &startupLabel, &startup, &timeout }) addAndMakeVisible(c);
             storageLabel.setText("Configuration storage", juce::dontSendNotification);
@@ -271,7 +270,7 @@ namespace
             juce::FlexBox buttons;
             buttons.flexDirection = juce::FlexBox::Direction::row;
             buttons.justifyContent = juce::FlexBox::JustifyContent::spaceBetween;
-            for (auto* button : { &openLog, &openLogFolder, &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll })
+            for (auto* button : { &openConfigFolder, &copyDiagnostics, &resetCache, &forgetAll })
                 buttons.items.add(juce::FlexItem(*button).withMinWidth(145.0f).withHeight(36.0f));
             buttons.performLayout(maintenance.toFloat());
         }
@@ -289,12 +288,14 @@ namespace
         void buttonClicked(juce::Button* button) override
         {
             auto& engine = VST3HostEngine::getInstance();
-            if (button == &openLog) engine.getLogFile().startAsProcess();
-            else if (button == &openLogFolder) engine.getLogFile().getParentDirectory().startAsProcess();
-            else if (button == &openConfigFolder) engine.getConfigFile().getParentDirectory().startAsProcess();
+            if (button == &openConfigFolder) engine.getConfigFile().getParentDirectory().startAsProcess();
             else if (button == &copyDiagnostics) juce::SystemClipboard::copyTextToClipboard(engine.getDiagnostics());
             else if (button == &resetCache) { engine.resetScanCache(); settings = engine.getSettingsSnapshot(); }
-            else if (button == &forgetAll) { engine.forgetAllPlugins(); settings = engine.getSettingsSnapshot(); }
+            else if (button == &forgetAll)
+            {
+                forgetAllCallback();
+                settings = engine.getSettingsSnapshot();
+            }
             else commit();
         }
         void comboBoxChanged(juce::ComboBox*) override { commit(); }
@@ -309,11 +310,12 @@ namespace
             settings.scanTimeoutSeconds = static_cast<int>(timeout.getValue());
             VST3HostEngine::getInstance().updateSettings(settings);
         }
+        std::function<void()> forgetAllCallback;
         bridge::BridgeSettings settings;
         juce::Label storageLabel, startupLabel, discoveryTitle, windowTitle, maintenanceTitle, timeoutLabel, timeoutHelp;
         juce::ComboBox storage, startup;
         juce::ToggleButton scanBridge, scanSystem, removeMissing, retryQuarantine, autoEditor, rememberWindow;
-        juce::TextButton openLog, openLogFolder, openConfigFolder, copyDiagnostics, resetCache, forgetAll;
+        juce::TextButton openConfigFolder, copyDiagnostics, resetCache, forgetAll;
         juce::Slider timeout;
     };
 }
@@ -338,7 +340,7 @@ HostContentComponent::HostContentComponent()
     }
     detailLabel.setColour(juce::TextEditor::textColourId, juce::Colours::lightgrey);
     detailLabel.setTooltip("Full plugin name, company, version and normalised VST3 bundle location for the selected entry.");
-    statusLabel.setTooltip("Current scan, startup, loading or recovery status. Detailed diagnostics are also written to the bridge log.");
+    statusLabel.setTooltip("Current scan, startup, loading or recovery status. Diagnostic messages go to the Windows debugger and are not saved to disk.");
     const auto startupWarning = VST3HostEngine::getInstance().getStartupWarning();
     if (startupWarning.isNotEmpty())
     {
@@ -348,14 +350,15 @@ HostContentComponent::HostContentComponent()
     pluginComboBox.setColour(juce::ComboBox::backgroundColourId, juce::Colour(panel));
     pluginComboBox.setTooltip("Switch the active VST3 or choose None - Bypass. The current plugin state is saved before switching and the selected plugin restores its own last state. The bridge window size is not reset automatically.");
     pluginComboBox.addListener(this);
-    for (auto* component : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &foldersButton,
+    for (auto* component : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &restartEngineButton, &foldersButton,
                              &removeButton, &settingsButton, &alwaysOnTopButton,
                              &visualizerButton, &fullscreenButton, &statusLabel, &detailLabel, &noEditorLabel })
         addAndMakeVisible(component);
-    for (auto* button : { &loadButton, &foldersButton, &removeButton, &settingsButton,
+    for (auto* button : { &loadButton, &restartEngineButton, &foldersButton, &removeButton, &settingsButton,
                           &alwaysOnTopButton, &visualizerButton, &fullscreenButton })
         button->addListener(this);
     loadButton.setTooltip("Choose one VST3 bundle, validate it in isolation, add it to the dropdown and load it.");
+    restartEngineButton.setTooltip("Asynchronously restart the isolated bridge host in safe bypass. Select the plugin again after recovery; its saved state is preserved.");
     foldersButton.setTooltip("Manage manual search locations, then scan one selected folder or every enabled folder. No automatic scan runs at startup.");
     removeButton.setTooltip("Open actions for the selected plugin. Reset Parameters recreates it without saved state, including non-parameter state such as loaded FIR data when supported. Reset Size changes only the bridge window using the current monitor resolution, aspect ratio and Windows DPI scale. You can also retry, forget, or open the folder containing the VST3 bundle.");
     settingsButton.setTooltip("Open compact bridge settings for storage, startup recovery, manual discovery, window restoration and diagnostics.");
@@ -388,10 +391,10 @@ void HostContentComponent::resized()
         pluginComboBox.setBounds(selector);
         controls.removeFromTop(6);
         auto commands = controls.removeFromTop(32);
-        juce::TextButton* commandButtons[] = { &loadButton, &foldersButton, &removeButton, &settingsButton,
+        juce::TextButton* commandButtons[] = { &loadButton, &restartEngineButton, &foldersButton, &removeButton, &settingsButton,
                                                &alwaysOnTopButton, &visualizerButton, &fullscreenButton };
         constexpr int gap = 6;
-        const int buttonWidth = (commands.getWidth() - gap * 6) / 7;
+        const int buttonWidth = (commands.getWidth() - gap * 7) / 8;
         for (auto* button : commandButtons)
         {
             button->setBounds(commands.removeFromLeft(buttonWidth).withHeight(30));
@@ -420,7 +423,7 @@ void HostContentComponent::setVisualizerMode(bool enabled)
 {
     if (visualizerMode == enabled) return;
     visualizerMode = enabled;
-    for (auto* c : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &foldersButton,
+    for (auto* c : std::initializer_list<juce::Component*> { &pluginLabel, &pluginComboBox, &loadButton, &restartEngineButton, &foldersButton,
                      &removeButton, &settingsButton, &alwaysOnTopButton,
                      &visualizerButton, &fullscreenButton, &statusLabel, &detailLabel }) c->setVisible(!enabled);
     resized(); repaint();
@@ -478,11 +481,32 @@ void HostContentComponent::comboBoxChanged(juce::ComboBox*)
         updatePluginList();
         VST3HostEngine::getInstance().saveState();
     }
+    else
+    {
+        statusLabel.setText("Could not load " + record.name + ". See debugger diagnostics.", false);
+        statusLabel.setTooltip(statusLabel.getText());
+        updatePluginList();
+    }
 }
 
 void HostContentComponent::buttonClicked(juce::Button* button)
 {
-    if (button == &alwaysOnTopButton || button == &visualizerButton)
+    if (button == &restartEngineButton)
+    {
+        auto& engine = VST3HostEngine::getInstance();
+        if (engine.requestSafeHostRestart())
+        {
+            statusLabel.setText("Restarting bridge engine in safe bypass. Select the plugin again after recovery.", false);
+            statusLabel.setTooltip(statusLabel.getText());
+        }
+        else
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                "Bridge engine restart unavailable",
+                "The bridge could not send a restart request to AIMP's audio process.");
+        }
+    }
+    else if (button == &alwaysOnTopButton || button == &visualizerButton)
     {
         auto settings = VST3HostEngine::getInstance().getSettingsSnapshot();
         if (button == &alwaysOnTopButton) settings.alwaysOnTop = !settings.alwaysOnTop;
@@ -505,11 +529,15 @@ void HostContentComponent::buttonClicked(juce::Button* button)
     else if (button == &removeButton)
     {
         const int index = pluginComboBox.getSelectedId() - 2;
-        if (juce::isPositiveAndBelow(index, records.size()))
+        const bool hasSelectedPlugin = juce::isPositiveAndBelow(index, records.size());
+        const auto record = hasSelectedPlugin ? records.getReference(index) : bridge::PluginRecord {};
+        const bool activePluginLoaded = VST3HostEngine::getInstance().getPluginInstance() != nullptr;
+        juce::PopupMenu menu;
+        menu.addItem(6, "Reload Plugin", activePluginLoaded);
+        menu.addSeparator();
+        if (hasSelectedPlugin)
         {
-            const auto record = records.getReference(index);
             const bool failed = record.scannerQuarantined || record.runtimeQuarantined || record.status != "Compatible";
-            juce::PopupMenu menu;
             if (failed) menu.addItem(1, "Retry and reset quarantine");
             const auto resolved = record.location.resolve(VST3HostEngine::getInstance().getRuntimePaths());
             const bool active = resolved.getFullPathName().equalsIgnoreCase(VST3HostEngine::getInstance().getActivePluginPath());
@@ -517,17 +545,18 @@ void HostContentComponent::buttonClicked(juce::Button* button)
             menu.addItem(5, "Reset Size", active);
             menu.addItem(2, "Forget");
             menu.addItem(3, "Open file location");
-            auto safe = juce::Component::SafePointer<HostContentComponent>(this);
-            menu.showMenuAsync({}, [record, safe](int result)
-            {
-                auto& engine = VST3HostEngine::getInstance();
-                if (result == 1) engine.retryPlugin(record.canonicalPath);
-                else if (result == 2) engine.removePluginFromList(record.canonicalPath);
-                else if (result == 3) bridge::vst3BundleRoot(record.location.resolve(engine.getRuntimePaths())).getParentDirectory().startAsProcess();
-                else if (result == 4 && safe != nullptr) safe->resetPluginParameters();
-                else if (result == 5 && safe != nullptr) safe->resetEditorSize();
-            });
         }
+        auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+        menu.showMenuAsync({}, [record, hasSelectedPlugin, safe](int result)
+        {
+            auto& engine = VST3HostEngine::getInstance();
+            if (result == 1 && hasSelectedPlugin) engine.retryPlugin(record.canonicalPath);
+            else if (result == 2 && hasSelectedPlugin) engine.removePluginFromList(record.canonicalPath);
+            else if (result == 3 && hasSelectedPlugin) bridge::vst3BundleRoot(record.location.resolve(engine.getRuntimePaths())).getParentDirectory().startAsProcess();
+            else if (result == 4 && safe != nullptr) safe->resetPluginParameters();
+            else if (result == 5 && safe != nullptr) safe->resetEditorSize();
+            else if (result == 6 && safe != nullptr) safe->reloadActivePlugin();
+        });
     }
     else if (button == &settingsButton)
     {
@@ -535,7 +564,19 @@ void HostContentComponent::buttonClicked(juce::Button* button)
         if (settingsWindow == nullptr)
         {
             juce::DialogWindow::LaunchOptions options; options.dialogTitle = "VST3 Bridge Settings";
-            options.content.setOwned(new SettingsComponent());
+            auto safe = juce::Component::SafePointer<HostContentComponent>(this);
+            options.content.setOwned(new SettingsComponent([safe]
+            {
+                if (safe == nullptr)
+                    return;
+                safe->clearEditorComponent();
+                auto& engine = VST3HostEngine::getInstance();
+                engine.forgetAllPlugins();
+                safe->updatePluginList();
+                safe->lastActivePath = engine.getActivePluginPath();
+                safe->statusLabel.setText("All remembered VST3 plugins were forgotten.", false);
+                safe->statusLabel.setTooltip(safe->statusLabel.getText());
+            }));
             options.useNativeTitleBar = true; options.resizable = true;
             settingsWindow.reset(options.create());
         }
@@ -658,6 +699,31 @@ void HostContentComponent::resetPluginParameters()
     clearEditorComponent();
     VST3HostEngine::getInstance().resetActivePluginParameters();
     refreshEditorComponent();
+}
+
+void HostContentComponent::reloadActivePlugin()
+{
+    auto& engine = VST3HostEngine::getInstance();
+    const auto path = engine.getActivePluginPath();
+    if (path.isEmpty() || engine.getPluginInstance() == nullptr)
+        return;
+
+    clearEditorComponent();
+    statusLabel.setText("Reloading VST3...", false);
+    if (engine.loadPlugin(path, true))
+    {
+        refreshEditorComponent();
+        engine.saveState();
+        statusLabel.setText("VST3 reloaded; saved state restored.", false);
+    }
+    else
+    {
+        refreshEditorComponent();
+        statusLabel.setText("VST3 reload failed. See debugger diagnostics.", false);
+    }
+
+    lastActivePath = engine.getActivePluginPath();
+    updatePluginList();
 }
 
 void HostContentComponent::resetEditorSize()

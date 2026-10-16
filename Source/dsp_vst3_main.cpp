@@ -46,18 +46,8 @@ namespace
 
     void WriteDebugLog(const char* message)
     {
-        wchar_t modulePath[32768] {};
-        GetModuleFileNameW(g_hInst, modulePath, static_cast<DWORD>(std::size(modulePath)));
-        const auto logPath = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath))).logFile;
-        FILE* file = nullptr;
-        if (_wfopen_s(&file, logPath.getFullPathName().toWideCharPointer(), L"ab") != 0 || file == nullptr)
-            return;
-
-        SYSTEMTIME st = {};
-        GetLocalTime(&st);
-        std::fprintf(file, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
-                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, message);
-        std::fclose(file);
+        OutputDebugStringA(message);
+        OutputDebugStringA("\n");
     }
 
     bool StartRuntime()
@@ -125,21 +115,8 @@ namespace
 
     void WriteDebugLog(const char* message)
     {
-        wchar_t modulePath[32768] {};
-        GetModuleFileNameW(g_hInst, modulePath, static_cast<DWORD>(std::size(modulePath)));
-        const auto logPath = bridge::RuntimePaths::detect(juce::File(juce::String(modulePath))).logFile;
-        SYSTEMTIME st = {};
-        GetLocalTime(&st);
-
-        FILE* file = nullptr;
-        if (_wfopen_s(&file, logPath.getFullPathName().toWideCharPointer(), L"ab") != 0 || file == nullptr)
-            return;
-
-        std::fprintf(file, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
-                     st.wYear, st.wMonth, st.wDay,
-                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                     message);
-        std::fclose(file);
+        OutputDebugStringA(message);
+        OutputDebugStringA("\n");
     }
 
     void WriteDebugLogF(const char* format, int a, int b, int c, int d)

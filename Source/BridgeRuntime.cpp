@@ -243,9 +243,6 @@ RuntimePaths RuntimePaths::detect(const juce::File& executablePath, const juce::
         result.storageMode = StorageMode::userProfile;
         result.portableFallback = wantsPortable;
     }
-    result.logFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getChildFile("dsp_vst3_bridge_" + makeInstanceId(result.packageRoot) + "_"
-                      + architectureName(currentArchitecture()) + "_" + juce::String::toHexString((int)GetCurrentProcessId()) + ".log");
     return result;
 }
 

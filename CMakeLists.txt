@@ -108,3 +108,9 @@ add_executable(BridgeRuntimeTests
 target_include_directories(BridgeRuntimeTests PRIVATE Source)
 target_link_libraries(BridgeRuntimeTests PRIVATE juce::juce_core)
 add_test(NAME BridgeRuntimeTests COMMAND BridgeRuntimeTests)
+
+add_executable(OutProcAudioClientTests
+    Source/OutProcAudioClientTests.cpp
+)
+target_include_directories(OutProcAudioClientTests PRIVATE Source)
+add_test(NAME OutProcAudioClientTests COMMAND OutProcAudioClientTests)
