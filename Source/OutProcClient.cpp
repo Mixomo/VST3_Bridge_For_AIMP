@@ -4,8 +4,8 @@
 #include "OutProcClient.h"
 #include "BridgeRuntime.h"
 
-#include <algorithm>
 #include <cstring>
+#include <exception>
 #include <sstream>
 
 namespace
@@ -75,6 +75,15 @@ bool OutProcClient::start(HMODULE bridgeModule)
         return true;
 
     stop();
+    try
+    {
+        if (!audioClient.prepare())
+            return false;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
     submittedBlocks = 0;
     completedBlocks = 0;
     missedBlocks = 0;
@@ -85,6 +94,10 @@ bool OutProcClient::start(HMODULE bridgeModule)
     clientCallbacksOver3ms = 0;
     emergencyBypassBlocks = 0;
     requestSequence = 0;
+    lastUnderruns = 0;
+    lastOverruns = 0;
+    lastStaleBlocks = 0;
+    lastProcessedBlocks = 0;
 
     SECURITY_ATTRIBUTES attributes { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
     mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &attributes, PAGE_READWRITE, 0,
@@ -110,11 +123,7 @@ bool OutProcClient::start(HMODULE bridgeModule)
     }
 
     std::memset(header, 0, sizeof(*header));
-    header->magic = VST3_BRIDGE_IPC_MAGIC;
-    header->version = VST3_BRIDGE_IPC_VERSION;
-    header->slotCount = VST3_BRIDGE_IPC_SLOT_COUNT;
-    header->maxAudioBytes = VST3_BRIDGE_IPC_MAX_AUDIO_BYTES;
-    inputStaging.resize(VST3_BRIDGE_IPC_MAX_AUDIO_BYTES);
+    new (header) VST3BridgeIpcHeader();
     LARGE_INTEGER frequency {};
     QueryPerformanceFrequency(&frequency);
     qpcFrequency = frequency.QuadPart;
@@ -134,7 +143,12 @@ bool OutProcClient::start(HMODULE bridgeModule)
         return false;
     }
     controlThread = CreateThread(nullptr, 0, controlThreadEntry, this, 0, nullptr);
-    return controlThread != nullptr;
+    if (controlThread == nullptr)
+    {
+        stop();
+        return false;
+    }
+    return true;
 }
 
 bool OutProcClient::launchHost(int architecture, bool safeStart)
@@ -164,7 +178,6 @@ bool OutProcClient::launchHost(int architecture, bool safeStart)
                                         nullptr, nullptr, &startup, &processInfo);
     if (!created)
     {
-        closeHandles();
         return false;
     }
 
@@ -192,15 +205,29 @@ void OutProcClient::stop()
 {
     stopping = true;
     if (controlEvent != nullptr) SetEvent(controlEvent);
+    if (controlThread != nullptr)
+    {
+        WaitForSingleObject(controlThread, INFINITE);
+        CloseHandle(controlThread);
+        controlThread = nullptr;
+    }
     stopHost();
-    if (controlThread != nullptr) { WaitForSingleObject(controlThread, 1500); CloseHandle(controlThread); controlThread = nullptr; }
     closeHandles();
 }
 
 void OutProcClient::stopHost()
 {
     if (shutdownEvent != nullptr) SetEvent(shutdownEvent);
-    if (processHandle != nullptr) { WaitForSingleObject(processHandle, 1500); CloseHandle(processHandle); processHandle = nullptr; }
+    if (processHandle != nullptr)
+    {
+        if (WaitForSingleObject(processHandle, 1500) != WAIT_OBJECT_0)
+        {
+            TerminateProcess(processHandle, 9);
+            WaitForSingleObject(processHandle, 1000);
+        }
+        CloseHandle(processHandle);
+        processHandle = nullptr;
+    }
     if (jobHandle != nullptr) { CloseHandle(jobHandle); jobHandle = nullptr; }
 }
 
@@ -216,13 +243,29 @@ void OutProcClient::controlLoop()
     {
         if (WaitForSingleObject(controlEvent, INFINITE) != WAIT_OBJECT_0 || stopping) break;
         const auto requested = InterlockedExchange(&header->requestedArchitecture, 0);
-        if (requested != static_cast<long>(bridge::Architecture::x86)
-            && requested != static_cast<long>(bridge::Architecture::x64)) continue;
+        const auto safeRestart = header->safeRestartRequested.exchange(0, std::memory_order_acq_rel) != 0;
+        if (!safeRestart && requested != static_cast<long>(bridge::Architecture::x86)
+            && requested != static_cast<long>(bridge::Architecture::x64))
+            continue;
+        const auto architecture = safeRestart
+            ? static_cast<int>(header->hostArchitecture)
+            : static_cast<int>(requested);
         stopHost();
         ResetEvent(shutdownEvent);
-        for (auto& slot : header->slots) InterlockedExchange(&slot.state, VST3_BRIDGE_SLOT_EMPTY);
-        requestSequence = 0;
-        launchHost(static_cast<int>(requested));
+        header->sessionEpoch.fetch_add(1, std::memory_order_acq_rel);
+        for (auto& slot : header->slots)
+        {
+            auto processing = VST3_BRIDGE_SLOT_PROCESSING;
+            slot.state.compare_exchange_strong(processing, VST3_BRIDGE_SLOT_EMPTY,
+                                               std::memory_order_acq_rel);
+        }
+        if (!launchHost(architecture, safeRestart))
+            continue;
+        if (safeRestart)
+        {
+            InterlockedIncrement(&header->showGuiSequence);
+            SetEvent(showEvent);
+        }
     }
 }
 
@@ -231,94 +274,35 @@ bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int
     LARGE_INTEGER startTicks {};
     QueryPerformanceCounter(&startTicks);
 
-    if (processHandle == nullptr || header == nullptr || samples == nullptr || numFrames <= 0
-        || numChannels <= 0 || bitsPerSample <= 0)
+    if (samples == nullptr || numFrames <= 0 || numChannels <= 0 || sampleRate <= 0)
         return false;
 
-    const std::uint64_t bytes = static_cast<std::uint64_t>(numFrames)
-                              * static_cast<std::uint64_t>(numChannels)
-                              * static_cast<std::uint64_t>(bitsPerSample / 8);
-    if (bytes == 0 || bytes > VST3_BRIDGE_IPC_MAX_AUDIO_BYTES)
+    if (header == nullptr)
         return false;
 
-    std::memcpy(inputStaging.data(), samples, static_cast<std::size_t>(bytes));
-    const auto sequence = ++requestSequence;
-    const auto expectedSequence = sequence > VST3_BRIDGE_IPC_PIPELINE_BLOCKS
-                                ? sequence - VST3_BRIDGE_IPC_PIPELINE_BLOCKS
-                                : 0;
-    bool copiedResponse = false;
-    int emptySlot = -1;
-
-    for (std::uint32_t i = 0; i < VST3_BRIDGE_IPC_SLOT_COUNT; ++i)
+    const auto previousSequence = requestSequence;
+    const auto submitted = audioClient.process(samples, numFrames, bitsPerSample, numChannels,
+                                               sampleRate, header, requestSequence);
+    const auto submittedCount = requestSequence - previousSequence;
+    if (submitted)
     {
-        auto& slot = header->slots[i];
-        const LONG state = InterlockedCompareExchange(&slot.state, VST3_BRIDGE_SLOT_EMPTY, VST3_BRIDGE_SLOT_EMPTY);
-
-        if (state == VST3_BRIDGE_SLOT_RESPONSE)
-        {
-            const bool isExpected = slot.status == 0
-                                 && slot.sequence == expectedSequence
-                                 && slot.audioBytes == bytes
-                                 && slot.numFrames == static_cast<std::uint32_t>(numFrames)
-                                 && slot.bitsPerSample == static_cast<std::uint32_t>(bitsPerSample)
-                                 && slot.numChannels == static_cast<std::uint32_t>(numChannels)
-                                 && slot.sampleRate == static_cast<std::uint32_t>(sampleRate);
-
-            if (isExpected)
-            {
-                std::memcpy(samples, vst3BridgeIpcAudio(header, i), static_cast<std::size_t>(bytes));
-                copiedResponse = true;
-                ++completedBlocks;
-                InterlockedExchange(&slot.state, VST3_BRIDGE_SLOT_EMPTY);
-                if (emptySlot < 0)
-                    emptySlot = static_cast<int>(i);
-            }
-            else if (slot.sequence <= expectedSequence)
-            {
-                ++staleBlocks;
-                InterlockedExchange(&slot.state, VST3_BRIDGE_SLOT_EMPTY);
-                if (emptySlot < 0)
-                    emptySlot = static_cast<int>(i);
-            }
-        }
-        else if (state == VST3_BRIDGE_SLOT_EMPTY && emptySlot < 0)
-        {
-            emptySlot = static_cast<int>(i);
-        }
-    }
-
-    if (!copiedResponse)
-    {
-        if (expectedSequence > 0)
-        {
-            // Preserve uninterrupted playback when Windows starves the helper.
-            // The current input is already in samples, so this is a dry bypass.
-            ++missedBlocks;
-            ++emergencyBypassBlocks;
-        }
-        else
-            std::memset(samples, 0, static_cast<std::size_t>(bytes));
-    }
-
-    if (emptySlot >= 0)
-    {
-        auto& slot = header->slots[static_cast<std::uint32_t>(emptySlot)];
-        std::memcpy(vst3BridgeIpcAudio(header, static_cast<std::uint32_t>(emptySlot)),
-                    inputStaging.data(),
-                    static_cast<std::size_t>(bytes));
-        slot.status = 0;
-        slot.audioBytes = static_cast<std::uint32_t>(bytes);
-        slot.numFrames = static_cast<std::uint32_t>(numFrames);
-        slot.bitsPerSample = static_cast<std::uint32_t>(bitsPerSample);
-        slot.numChannels = static_cast<std::uint32_t>(numChannels);
-        slot.sampleRate = static_cast<std::uint32_t>(sampleRate);
-        slot.sequence = sequence;
-        InterlockedExchange(&slot.state, VST3_BRIDGE_SLOT_REQUEST);
         SetEvent(requestEvent);
-        ++submittedBlocks;
+        submittedBlocks.fetch_add(submittedCount, std::memory_order_relaxed);
     }
-    else
-        ++queueFullBlocks;
+
+    const auto underruns = header->underruns.load(std::memory_order_relaxed);
+    const auto overruns = header->overruns.load(std::memory_order_relaxed);
+    const auto stale = header->staleBlocks.load(std::memory_order_relaxed);
+    const auto completed = header->processedBlocks.load(std::memory_order_relaxed);
+    missedBlocks.fetch_add(underruns - lastUnderruns, std::memory_order_relaxed);
+    emergencyBypassBlocks.fetch_add(underruns - lastUnderruns, std::memory_order_relaxed);
+    queueFullBlocks.fetch_add(overruns - lastOverruns, std::memory_order_relaxed);
+    staleBlocks.fetch_add(stale - lastStaleBlocks, std::memory_order_relaxed);
+    completedBlocks.fetch_add(completed - lastProcessedBlocks, std::memory_order_relaxed);
+    lastUnderruns = underruns;
+    lastOverruns = overruns;
+    lastStaleBlocks = stale;
+    lastProcessedBlocks = completed;
 
     LARGE_INTEGER endTicks {};
     QueryPerformanceCounter(&endTicks);
@@ -335,7 +319,7 @@ bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int
     if (elapsedMicros > 3000)
         clientCallbacksOver3ms.fetch_add(1, std::memory_order_relaxed);
 
-    return copiedResponse;
+    return submitted;
 }
 
 bool OutProcClient::showEditor()
@@ -361,8 +345,6 @@ void OutProcClient::closeHandles()
     if (header != nullptr)
         UnmapViewOfFile(header);
     header = nullptr;
-    inputStaging.clear();
-
     for (auto* handle : { &mapping, &requestEvent, &shutdownEvent, &showEvent, &dspStartEvent, &controlEvent, &processHandle, &jobHandle })
     {
         if (*handle != nullptr)

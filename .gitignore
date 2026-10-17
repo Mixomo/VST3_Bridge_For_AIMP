@@ -5,6 +5,7 @@
 /cmake-build-*/
 /.vs/
 /.vscode/
+/dist/vst3
 
 # Visual Studio / MSBuild
 *.sln

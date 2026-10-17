@@ -132,17 +132,16 @@ namespace
                       "Include the standard Windows VST3 folders in Scan All.");
             configure(openWithAimp, "Open rack window with AIMP", settings.openRackOnStartup,
                       "Show the rack window automatically when AIMP starts this DSP.");
-            openLog.setButtonText("Open Log"); openConfig.setButtonText("Open Config Folder");
+            openConfig.setButtonText("Open Config Folder");
             diagnostics.setButtonText("Copy Diagnostics"); resetCache.setButtonText("Reset Scan Cache");
             forgetAll.setButtonText("Forget All Plugins");
-            openLog.setTooltip("Open the current VST3 Bridge Rack For AIMP diagnostic log.");
             openConfig.setTooltip("Open the folder containing this rack's independent configuration.");
             diagnostics.setTooltip("Copy rack, architecture, paths and plug-in diagnostics to the clipboard.");
             resetCache.setTooltip("Clear scan fingerprints and quarantines while keeping the rack and saved states.");
             forgetAll.setTooltip("Clear the rack and forget every scanned VST3 entry. Plug-in files are not deleted.");
             for (auto* component : std::initializer_list<juce::Component*> { &storageLabel, &storage, &startupLabel, &startup,
-                     &scanBridge, &scanSystem, &openWithAimp, &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll }) addAndMakeVisible(component);
-            for (auto* button : { &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll }) button->addListener(this);
+                     &scanBridge, &scanSystem, &openWithAimp, &openConfig, &diagnostics, &resetCache, &forgetAll }) addAndMakeVisible(component);
+            for (auto* button : { &openConfig, &diagnostics, &resetCache, &forgetAll }) button->addListener(this);
             setSize(720, 365);
         }
         ~SettingsComponent() override { commit(); }
@@ -155,8 +154,8 @@ namespace
             area.removeFromTop(18); scanBridge.setBounds(area.removeFromTop(34)); scanSystem.setBounds(area.removeFromTop(34));
             openWithAimp.setBounds(area.removeFromTop(34));
             area.removeFromTop(20); row = area.removeFromTop(38);
-            const auto buttonWidth = row.getWidth() / 5;
-            for (auto* button : { &openLog, &openConfig, &diagnostics, &resetCache, &forgetAll })
+            const auto buttonWidth = row.getWidth() / 4;
+            for (auto* button : { &openConfig, &diagnostics, &resetCache, &forgetAll })
                 button->setBounds(row.removeFromLeft(buttonWidth).reduced(3));
         }
     private:
@@ -166,8 +165,7 @@ namespace
         void buttonClicked(juce::Button* button) override
         {
             auto& engine = VST3HostEngine::getInstance();
-            if (button == &openLog) engine.getLogFile().startAsProcess();
-            else if (button == &openConfig) engine.getConfigFile().getParentDirectory().startAsProcess();
+            if (button == &openConfig) engine.getConfigFile().getParentDirectory().startAsProcess();
             else if (button == &diagnostics) juce::SystemClipboard::copyTextToClipboard(engine.getDiagnostics());
             else if (button == &resetCache) engine.resetScanCache();
             else if (button == &forgetAll)
@@ -191,7 +189,7 @@ namespace
         juce::Label storageLabel, startupLabel;
         juce::ComboBox storage, startup;
         juce::ToggleButton scanBridge, scanSystem, openWithAimp;
-        juce::TextButton openLog, openConfig, diagnostics, resetCache, forgetAll;
+        juce::TextButton openConfig, diagnostics, resetCache, forgetAll;
         std::function<void()> forgetCallback;
     };
 }
@@ -679,8 +677,10 @@ HostContentComponent::HostContentComponent()
     title.setFont(juce::FontOptions(23.0f).withStyle("Bold"));
     title.setColour(juce::Label::textColourId, juce::Colour(accent));
     title.setTooltip("Ordered VST3 processing rack. Audio flows from slot 01 downward.");
-    for (auto* button : { &addButton, &cardStatesButton, &foldersButton, &settingsButton }) { button->addListener(this); addAndMakeVisible(button); }
+    for (auto* button : { &addButton, &reloadBridgeButton, &cardStatesButton, &foldersButton, &settingsButton })
+    { button->addListener(this); addAndMakeVisible(button); }
     addButton.setTooltip("Open all scanned VST3 plug-ins or choose Add VST to scan one file, then append it to the rack.");
+    reloadBridgeButton.setTooltip("Asynchronously restart the isolated rack host in safe bypass. The saved rack and states are preserved; the rack is not restored automatically.");
     foldersButton.setTooltip("Manage VST3 search folders and run a scan.");
     settingsButton.setTooltip("Open rack storage, startup, scan and diagnostic settings.");
     cardStatesButton.setTooltip("Expand every card, collapse every card, or remove all rack cards.");
@@ -714,6 +714,7 @@ void HostContentComponent::resized()
     auto header = area.removeFromTop(headerHeight);
     title.setBounds(header.removeFromLeft(310));
     addButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
+    reloadBridgeButton.setBounds(header.removeFromLeft(140).reduced(4, 14));
     cardStatesButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
     foldersButton.setBounds(header.removeFromLeft(130).reduced(4, 14));
     settingsButton.setBounds(header.removeFromLeft(110).reduced(4, 14));
@@ -1048,6 +1049,16 @@ void HostContentComponent::addPluginRecord(int recordIndex, int insertAt)
 void HostContentComponent::buttonClicked(juce::Button* button)
 {
     if (button == &addButton) showAddMenu(VST3HostEngine::getInstance().getRackSize());
+    else if (button == &reloadBridgeButton)
+    {
+        auto& engine = VST3HostEngine::getInstance();
+        if (engine.requestSafeHostRestart())
+            statusLabel.setText("Restarting rack host in safe bypass. Your saved rack and plug-in states are preserved.", false);
+        else
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                "Rack host restart unavailable",
+                "The bridge could not send a restart request to AIMP's audio process.");
+    }
     else if (button == &cardStatesButton) showCardStatesMenu();
     else if (button == &foldersButton) openFolderManager();
     else if (button == &settingsButton) openSettings();

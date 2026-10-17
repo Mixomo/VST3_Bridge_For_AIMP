@@ -64,6 +64,7 @@ private:
 
     juce::Label title;
     juce::TextButton addButton { "+  Add VST" };
+    juce::TextButton reloadBridgeButton { "Reload Bridge" };
     juce::TextButton foldersButton { "Scan Folders" };
     juce::TextButton settingsButton { "Settings" };
     juce::TextButton cardStatesButton { "Card States..." };

@@ -19,6 +19,12 @@ This branch is an independent rack product. It does not contain the single-plug-
 - Versioned atomic JSON configuration with portable and user-profile storage.
 - AIMP-inspired grey/orange interface, active-card highlighting, orange scrollbar and tooltips for every host control.
 
+## Changelog 2026-10-16 | 1.0.1
+
+- Added fixed 512-frame audio IPC quantums with latency-aligned wet/dry processing and stale-block invalidation when the stream format or host session changes.
+- Added **Reload Bridge** to restart the isolated rack host asynchronously in safe bypass while preserving the saved rack and plug-in states.
+- Added `build.bat` for building, testing and packaging both x86 and x64 targets.
+
 ## Install
 
 Download the `.aimppack` from the **Releases Page** or from [`dist/dsp_vst3_rack.aimppack`](dist/dsp_vst3_rack.aimppack) and install it through AIMP's plug-in manager, then select `VST3 Bridge Rack for AIMP - Mixomo` in AIMP's DSP selector.
@@ -61,6 +67,8 @@ The selected card uses a dark-orange background. The rack scrolls vertically and
 **Card States...** contains **Expand all cards**, **Collapse all cards** and **Remove all cards**.
 
 **Scan Folders** opens the saved discovery-location list.
+
+**Reload Bridge** asynchronously restarts the isolated rack host in safe bypass. The saved rack and plug-in states are preserved, but the rack is not loaded automatically; restore it from the rack controls after recovery.
 
 **Settings** opens storage, startup, scan and maintenance options.
 
@@ -157,9 +165,8 @@ Window geometry and Detached/Full Screen state are not persisted.
 
 ### Maintenance
 
-- **Open Log** opens the current process log.
 - **Open Config Folder** opens the active configuration directory.
-- **Copy Diagnostics** copies rack, architecture, path and plug-in information without opaque Base64 state.
+- **Copy Diagnostics** copies rack, architecture, path and plug-in information without opaque Base64 state. Diagnostic messages are available through the Windows debugger.
 - **Reset Scan Cache** clears fingerprints and quarantine while preserving the rack, known plug-ins and saved states.
 - **Forget All Plugins** clears the rack and scanned list. It never deletes `.vst3` files.
 
@@ -185,8 +192,10 @@ Requirements: Windows 10/11, Visual Studio 2022 with the C++ desktop workload, C
 Build, test, validate and package x86/x64:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Build-All.ps1
+.\build.bat
 ```
+
+Pass `Debug` as the first argument to build the Debug configuration; Release is the default.
 
 Build one architecture:
 
@@ -198,13 +207,7 @@ ctest --test-dir build_x64 -C Release --output-on-failure
 
 The resulting installer is `dist/dsp_vst3_rack.aimppack`.
 
-## Diagnostics
-
-Logs are isolated per installation, architecture and process under `%TEMP%`, with names similar to:
-
-```text
-%TEMP%\dsp_vst3_rack_<instance>_x64_<pid>.log
-```
+**Reload Bridge** restarts the isolated host asynchronously without blocking AIMP's audio callback or GUI. The replacement starts in safe bypass and preserves the saved rack and plug-in states without automatically restoring the rack. The rack GUI must remain responsive to use this action; if a VST3 also freezes the GUI, disable and re-enable the DSP in AIMP.
 
 The startup recovery check can be run manually:
 
@@ -218,11 +221,14 @@ A failed recovery check starts the bridge in dry bypass and reports a warning wi
 
 ## Limitations
 
+> [!NOTE]
+> Audio cracks, pops, clicks, and stutters may occur during playback, especially when using audio devices in ASIO mode. These issues are external to the VST3 Bridge and can occur even when the bridge is disabled or no VST3 is loaded. They depend on factors such as your computer's CPU, audio device, sample rate and buffer size, as well as software-related factors including GPU drivers and background operating-system processes. On Windows, you can use [LatencyMon](https://www.resplendence.com/latencymon) to check which system components contribute most to latency.
+
 - Universal VST3 compatibility is not possible. Some plug-ins require DAW-specific transport, MIDI, sidechains, licensing services or GPU/WebView behavior.
 - A single rack chain cannot mix x86 and x64 VST3 instances.
 - Legacy system-DPI editors can remain imperfect on mixed-DPI systems. Scale-aware VST3/JUCE editors behave best.
 - A host can restore only data serialised by the VST3.
-- The asynchronous pipeline adds latency so AIMP's audio callback never waits for another process.
+- The asynchronous pipeline uses fixed 512-frame IPC quantums and a latency-aligned wet/dry path so AIMP's audio callback never waits for another process. Transport epochs invalidate stale blocks when the sample rate, channel count, callback size or host session changes.
 - Very high CPU or DPC latency can still starve the isolated host; bypass protects continuity but cannot create CPU time.
 
 ## Licensing And Credits

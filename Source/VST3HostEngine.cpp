@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 // Raw pointer — no destructor fires at DLL_PROCESS_DETACH.
@@ -698,7 +699,10 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     }
     
     if (rackInstances.empty())
+    {
+        rackLatencySamples.store(0, std::memory_order_release);
         return numFrames;
+    }
     
     // Check if format changed and re-prepare if necessary
     if (bridge::rackNeedsPreparation(pluginPrepared, currentSampleRate, currentNumChannels, currentBlockSize,
@@ -739,6 +743,7 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
             {
                 writeLog("Rack process block failed with Windows structured exception: " + slot.path);
                 quarantineFailedPlugin(slot.path);
+                rackLatencySamples.store(0, std::memory_order_release);
                 return numFrames;
             }
         }
@@ -746,6 +751,7 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         {
             writeLog("Rack process block failed with C++ exception: " + slot.path);
             quarantineFailedPlugin(slot.path);
+            rackLatencySamples.store(0, std::memory_order_release);
             return numFrames;
         }
     }
@@ -772,6 +778,16 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
         nonFiniteOutputSamples.fetch_add(blockNonFiniteSamples, std::memory_order_relaxed);
     updateAtomicMax(maxOutputMilliAbs, blockMaxMilliAbs);
 
+    const auto anyActiveSolo = std::any_of(rackInstances.begin(), rackInstances.end(),
+                                           [](const auto& slot) { return slot.solo; });
+    std::uint64_t totalLatency = 0;
+    for (const auto& slot : rackInstances)
+        if (!slot.muted && (!anyActiveSolo || slot.solo))
+            totalLatency += static_cast<std::uint32_t>(juce::jmax(0, slot.plugin->getLatencySamples()));
+    rackLatencySamples.store(static_cast<std::uint32_t>(
+        juce::jmin<std::uint64_t>(totalLatency, std::numeric_limits<std::uint32_t>::max())),
+        std::memory_order_release);
+
     const auto elapsedTicks = juce::Time::getHighResolutionTicks() - callbackStartTicks;
     const auto elapsedMicros = static_cast<int>(elapsedTicks * 1000000 / juce::Time::getHighResolutionTicksPerSecond());
     updateAtomicMax(maxCallbackMicros, elapsedMicros);
@@ -789,10 +805,14 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
     currentNumChannels = numChannels;
     currentBlockSize = juce::jmax(1, blockSize);
     pluginPrepared = false;
+    rackLatencySamples.store(0, std::memory_order_release);
     lastOutputTail.ensureStorageAllocated(numChannels);
     
     if (rackInstances.empty())
+    {
+        rackLatencySamples.store(0, std::memory_order_release);
         return false;
+    }
 
     writeLog("Preparing rack: sampleRate=" + juce::String(sampleRate)
              + " channels=" + juce::String(numChannels)
@@ -818,6 +838,15 @@ bool VST3HostEngine::preparePlugin(double sampleRate, int numChannels, int block
         processor.prepareToPlay(sampleRate, currentBlockSize);
         writeLog("Prepared rack slot: " + slot.path + "; latency=" + juce::String(processor.getLatencySamples()));
     }
+    const auto anySolo = std::any_of(rackInstances.begin(), rackInstances.end(),
+                                     [](const auto& slot) { return slot.solo; });
+    std::uint64_t totalLatency = 0;
+    for (const auto& slot : rackInstances)
+        if (!slot.muted && (!anySolo || slot.solo))
+            totalLatency += static_cast<std::uint32_t>(juce::jmax(0, slot.plugin->getLatencySamples()));
+    rackLatencySamples.store(static_cast<std::uint32_t>(
+        juce::jmin<std::uint64_t>(totalLatency, std::numeric_limits<std::uint32_t>::max())),
+        std::memory_order_release);
     pluginPrepared = true;
     useDoublePrecision = false;
     processLogCountdown = 8;
@@ -832,17 +861,11 @@ juce::File VST3HostEngine::getConfigFile() const
     return runtimePaths.activeConfig;
 }
 
-juce::File VST3HostEngine::getLogFile() const
-{
-    return runtimePaths.logFile;
-}
-
 void VST3HostEngine::writeLog(const juce::String& message) const
 {
-    auto logFile = getLogFile();
-    auto timestamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d %H:%M:%S.");
-    auto millis = juce::String(juce::Time::getCurrentTime().getMilliseconds()).paddedLeft('0', 3);
-    logFile.appendText(timestamp + millis + " " + message + "\r\n", false, false, "\r\n");
+    const auto utf8 = message.toRawUTF8();
+    OutputDebugStringA(utf8);
+    OutputDebugStringA("\n");
 }
 
 void VST3HostEngine::saveState()
@@ -1134,7 +1157,6 @@ juce::String VST3HostEngine::getDiagnostics() const
          << "Rack slots: " << static_cast<int>(rackInstances.size()) << "/" << bridge::maxRackSlots << "\r\n"
          << "Configuration: " << runtimePaths.activeConfig.getFullPathName() << "\r\n"
          << "Bridge root: " << runtimePaths.packageRoot.getFullPathName() << "\r\n"
-         << "Log: " << runtimePaths.logFile.getFullPathName() << "\r\n"
          << "Cached plugins: " << snapshot.plugins.size() << "\r\n"
          << "Scanner quarantine: " << scannerQuarantine << "; runtime quarantine: " << runtimeQuarantine << "\r\n";
     for (const auto& folder : snapshot.scanFolders)
@@ -1145,6 +1167,16 @@ juce::String VST3HostEngine::getDiagnostics() const
 void VST3HostEngine::setHostArchitectureRequester(std::function<void(bridge::Architecture)> callback)
 {
     hostArchitectureRequester = std::move(callback);
+}
+
+void VST3HostEngine::setSafeHostRestartRequester(std::function<bool()> callback)
+{
+    safeHostRestartRequester = std::move(callback);
+}
+
+bool VST3HostEngine::requestSafeHostRestart()
+{
+    return safeHostRestartRequester && safeHostRestartRequester();
 }
 
 void VST3HostEngine::requestHostArchitecture(const bridge::PluginRecord& plugin)
@@ -1268,8 +1300,9 @@ bridge::PluginRecord VST3HostEngine::scanOne(const juce::File& file)
         return record;
     }
 
-    const auto resultFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getNonexistentChildFile("vst3_scan_" + juce::Uuid().toString(), ".json", false);
+    const auto resultDirectory = runtimePaths.activeConfig.getParentDirectory();
+    const auto resultFile = resultDirectory.getNonexistentChildFile(
+        "vst3_scan_" + juce::Uuid().toString(), ".json", false);
     juce::StringArray arguments { scanner.getFullPathName(), "--plugin", bundle.getFullPathName(),
                                   "--result", resultFile.getFullPathName() };
     juce::ChildProcess child;

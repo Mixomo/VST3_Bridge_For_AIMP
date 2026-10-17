@@ -74,6 +74,12 @@ public:
     void forgetAllPlugins();
     juce::String getDiagnostics() const;
     void setHostArchitectureRequester(std::function<void(bridge::Architecture)> callback);
+    void setSafeHostRestartRequester(std::function<bool()> callback);
+    bool requestSafeHostRestart();
+    std::uint32_t getRackLatencySamples() const
+    {
+        return rackLatencySamples.load(std::memory_order_acquire);
+    }
     void requestHostArchitecture(const bridge::PluginRecord& plugin);
 
     // AudioProcessorListener callbacks
@@ -92,7 +98,6 @@ public:
 
     bool preparePlugin(double sampleRate, int numChannels, int blockSize);
     juce::File getConfigFile() const;
-    juce::File getLogFile() const;
     void writeLog(const juce::String& message) const;
 
     void* dllInstance = nullptr;
@@ -123,6 +128,7 @@ public:
     int currentNumChannels = 0;
     int currentBlockSize = 0;
     bool pluginPrepared = false;
+    std::atomic<std::uint32_t> rackLatencySamples { 0 };
     bool useDoublePrecision = false;
     int64_t processedSamples = 0;
     int lastLoggedLatency = -1;
@@ -185,6 +191,7 @@ public:
     juce::String scanSummary;
     juce::StringArray scanIssues;
     std::function<void(bridge::Architecture)> hostArchitectureRequester;
+    std::function<bool()> safeHostRestartRequester;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VST3HostEngine)
 };
