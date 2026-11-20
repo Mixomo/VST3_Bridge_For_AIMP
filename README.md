@@ -9,8 +9,8 @@ VST3 Bridge for AIMP hosts a VST3 effect in AIMP's DSP pipeline, including ASIO 
 ## Features
 
 - AIMP SDK v5.40 build 2650 integration.
-- One active VST3 effect at a time, with asynchronous shared-memory audio IPC.
-- 512-frame audio quanta with timestamped wet/dry alignment; sample-rate and channel changes invalidate stale host responses.
+- One active VST3 effect at a time, with pipelined shared-memory audio IPC (~40 ms slack) that works with AIMP's bursty DirectSound/WASAPI calls and its real-time ASIO callback.
+- A late, missing or hung host falls back to dry audio on the same timeline with a crossfade; buffer and sample-rate changes reuse the running host.
 - Native x86 and x64 AIMP DLLs, hosts and scanners in one package.
 - Mixed-bitness hosting: either AIMP architecture can restart the isolated x86 or x64 host required by the selected plug-in.
 - Manual discovery in the bridge package, its `VST3` folder, custom folders and optional standard-system folders.
@@ -24,7 +24,16 @@ VST3 Bridge for AIMP hosts a VST3 effect in AIMP's DSP pipeline, including ASIO 
 - Generic visualizer and fullscreen modes, always-on-top and remembered window geometry per bridge installation.
 - Separate parameter/state and window-size resets. Window sizing is monitor-, aspect-ratio- and DPI-aware and remains a manual action, so switching VST3 plug-ins does not overwrite the user's persisted geometry.
 - Per-Monitor DPI Awareness manifests for all hosts and scanners. JUCE handles live per-monitor scale changes and forwards supported VST3 editor scaling/resizing requests.
-- Asynchronous safe-mode host restart from Settings, preserving the saved plug-in selection and state without creating diagnostic files.
+- Asynchronous safe-mode host restart from Settings, preserving the saved plug-in selection and state.
+
+### Changelog — 2026-11-20 | 3.0.2
+
+- **Audio transport (fixes stutters, clicks, pops and mutes, issue #4):** AIMP calls Winamp DSPs in bursts from its buffering thread with DirectSound/WASAPI, and from inside the driver callback (native buffer, hard real-time deadline) with ASIO. The previous transport assumed neither: processed audio arrived late and the bridge fell back to dry or held samples. The new transport runs the VST3 with a fixed ~40 ms slack: each callback hands its audio to the isolated host and plays the host's result for audio it received ~40 ms earlier, so the ASIO callback normally never waits for the plug-in and CPU spikes up to the slack are absorbed. In burst mode it waits (bounded) only for audio the host has not finished. Late audio falls back to dry audio on the same timeline with a short crossfade, never to silence or held samples.
+- **No mute on buffer, sample-rate or device changes:** AIMP restarts the DSP on these changes. The isolated host is now kept alive for 4 s after the DSP stops and reused if it restarts, instead of being shut down and relaunched on AIMP's thread (which blocked AIMP for ~3 s). The start-up smoke test runs once per AIMP session per plug-in.
+- **Host audio thread:** registered with MMCSS ("Pro Audio"); plug-ins are prepared for the largest IPC block up front, and each block is passed with its exact length.
+- **Diagnostics (automatic):** while AIMP runs, the bridge writes to `%TEMP%`: an event log from AIMP's side (`vst3bridge_aimp_*.log`: DSP start/stop with durations, host launch/exit, 10-second audio summaries), one per host process (`vst3bridge_host_*.log`), and a per-callback timing CSV (`vst3bridge_audio_*.csv`). Logs are size-capped and only the newest 40 files are kept. `%TEMP%\vst3bridge_nolog.flag` disables the event logs and `%TEMP%\vst3bridge_nodiag.flag` the CSV.
+- **AIMP SDK:** updated to the AIMP SDK v5.40 release of 09.11.2026.
+- **Documentation:** added a warning against changing the output device, sample rate or ASIO buffer size while audio is playing (see Limitations).
 
 ### Changelog — 2026-10-16 | 3.0.1
 
@@ -225,7 +234,7 @@ ctest --test-dir build_x64 -C Release --output-on-failure
 
 ## Diagnostics
 
-Settings provides **Open Config Folder**, **Copy Diagnostics**, and **Reset Scan Cache**. The main bridge window provides **Reload Bridge** for safe host recovery. The bridge does not write diagnostic logs or watchdog files to disk; diagnostic messages are available through the Windows debugger. Scanner result files are transient and are created beside the active configuration, not in `%TEMP%`.
+Settings provides **Open Config Folder**, **Copy Diagnostics**, and **Reset Scan Cache**. The main bridge window provides **Reload Bridge** for safe host recovery. The bridge writes size-capped event logs and a per-callback audio timing CSV to `%TEMP%` (`vst3bridge_*`, newest 40 files kept); the same messages are also sent to the Windows debugger. Scanner result files are transient and are created beside the active configuration, not in `%TEMP%`.
 
 Diagnostics omit the Base64 VST3 state. A failed or frozen scanner is terminated independently. A runtime plug-in failure immediately leaves the audio path in dry bypass.
 
@@ -244,10 +253,13 @@ At runtime the DLL performs this check in an isolated process. Failure or timeou
 > [!NOTE]
 > Audio cracks, pops, clicks, and stutters may occur during playback, especially when using audio devices in ASIO mode. These issues are external to the VST3 Bridge and can occur even when the bridge is disabled or no VST3 is loaded. They depend on factors such as your computer's CPU, audio device, sample rate and buffer size, as well as software-related factors including GPU drivers and background operating-system processes. On Windows, you can use [LatencyMon](https://www.resplendence.com/latencymon) to check which system components contribute most to latency.
 
+> [!WARNING]
+> **Do not change audio engine settings while audio is playing.** Changing the output device, sample rate or ASIO buffer size during playback (from AIMP's settings or the audio interface's control panel) is not recommended. AIMP does not always recover from a live device reset: it can stop requesting audio for several seconds, or request it slower than real time, which is heard as mutes, dropouts or "lagging" audio until AIMP is restarted. This also happens with the VST3 DSP disabled, and the bridge's logs show AIMP stops calling the DSP during these periods. Stop playback first, change the setting, then re-select the output device in AIMP (or restart AIMP) before playing again.
+
 - Universal VST3 compatibility is not possible; some plug-ins assume DAW transport, MIDI, sidechains, licensing services or host-specific behavior.
 - Legacy system-DPI editors can remain imperfect on mixed-DPI systems. The bridge does not bitmap-stretch them; scale-aware VST3/JUCE editors behave best.
 - A host can preserve and restore only state that the VST3 serialises. Plug-in-specific GUI scale or external resources that are omitted from VST3 state remain the plug-in's responsibility.
-- The asynchronous pipeline uses two transport quantums sized for the greater of 512 frames, about 10 ms at the current sample rate, or the largest callback observed (up to 65,536 frames). This provides at least 1024 samples of baseline latency at 44.1 kHz, plus the VST3's reported processing latency, so AIMP's audio callback never waits for another process. Dry bypass is aligned to that timeline.
+- The audio transport adds a fixed ~40 ms of latency (plus the VST3's own) so the isolated host can process ahead of AIMP's callback. With ASIO, AIMP's driver callback normally does not wait for the plug-in at all; with DirectSound/WASAPI, AIMP's buffering thread waits only for audio the host has not finished yet. If the host misses that window, the affected audio passes dry on the same timeline with a short crossfade.
 - Very high CPU/DPC latency can still starve AIMP or the isolated host; bypass protects continuity but cannot create CPU time.
 - Physical mixed-monitor, unusual GPU/WebView editor and commercial licensing behavior must be validated on the target system.
 - Plug-in files, licenses and external services are not made portable by storing bridge paths relatively.

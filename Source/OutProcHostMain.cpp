@@ -5,6 +5,7 @@
 #include "HostWindow.h"
 #include "BridgeRuntime.h"
 #include "OutProcProtocol.h"
+#include "BridgeLog.h"
 #include "VST3HostEngine.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 namespace
 {
@@ -58,34 +60,120 @@ namespace
     {
         VST3BridgeIpcHeader* header = nullptr;
         HANDLE requestEvent = nullptr;
+        HANDLE responseEvent = nullptr;
         HANDLE shutdownEvent = nullptr;
     };
+
+    // Registers the audio thread with MMCSS ("Pro Audio") when available so the
+    // scheduler treats it like other real-time audio threads.
+    std::uint32_t boostAudioThread()
+    {
+        bool mmcss = false;
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        using SetMmThreadCharacteristics = HANDLE (WINAPI*)(LPCWSTR, LPDWORD);
+        if (auto* avrt = LoadLibraryW(L"avrt.dll"))
+            if (auto* setCharacteristics = reinterpret_cast<SetMmThreadCharacteristics>(
+                    reinterpret_cast<void*>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW"))))
+            {
+                DWORD taskIndex = 0;
+                mmcss = setCharacteristics(L"Pro Audio", &taskIndex) != nullptr;
+            }
+        return static_cast<std::uint32_t>(GetThreadPriority(GetCurrentThread()) + 16) | (mmcss ? 0x100u : 0u);
+    }
+
+    bool headerMatches(const VST3BridgeIpcHeader* header)
+    {
+        return header != nullptr && header->magic == VST3_BRIDGE_IPC_MAGIC
+            && header->version == VST3_BRIDGE_IPC_VERSION
+            && header->slotCount == VST3_BRIDGE_IPC_SLOT_COUNT
+            && header->maxBlockFrames == VST3_BRIDGE_IPC_MAX_BLOCK_FRAMES
+            && header->maxChannels == VST3_BRIDGE_IPC_MAX_CHANNELS;
+    }
+
+    void processSlot(VST3BridgeIpcHeader* header, std::uint32_t slotIndex, std::vector<std::int32_t>& pcm)
+    {
+        auto& slot = header->slots[slotIndex];
+        auto* const slotInput = vst3BridgeIpcSlotInput(header, slotIndex);
+        auto* const slotOutput = vst3BridgeIpcSlotOutput(header, slotIndex);
+        slot.status = VST3_BRIDGE_SLOT_BYPASS;
+
+        const bool valid = slot.numFrames > 0 && slot.numFrames <= VST3_BRIDGE_IPC_MAX_BLOCK_FRAMES
+            && slot.numChannels > 0 && slot.numChannels <= VST3_BRIDGE_IPC_MAX_CHANNELS
+            && slot.sampleRate > 0
+            && slot.epoch == header->sessionEpoch.load(std::memory_order_acquire);
+        if (!valid)
+        {
+            header->staleBlocks.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        try
+        {
+            const auto channels = static_cast<int>(slot.numChannels);
+            const auto frames = static_cast<int>(slot.numFrames);
+            for (int channel = 0; channel < channels; ++channel)
+                for (int frame = 0; frame < frames; ++frame)
+                {
+                    const auto sample = std::clamp(
+                        slotInput[static_cast<std::size_t>(channel) * frames + frame], -1.0, 1.0);
+                    pcm[static_cast<std::size_t>(frame) * channels + channel] =
+                        static_cast<std::int32_t>(sample * 2147483647.0);
+                }
+
+            auto& engine = VST3HostEngine::getInstance();
+            engine.processAudio(pcm.data(), frames, 32, channels, static_cast<int>(slot.sampleRate));
+            const bool processed = engine.wasLastAudioBlockProcessed();
+
+            // The engine leaves (smoothed) pass-through audio in the buffer when
+            // no plug-in is ready, so its output is always the right answer.
+            for (int channel = 0; channel < channels; ++channel)
+                for (int frame = 0; frame < frames; ++frame)
+                    slotOutput[static_cast<std::size_t>(channel) * frames + frame] =
+                        pcm[static_cast<std::size_t>(frame) * channels + channel] / 2147483648.0;
+
+            if (slot.epoch == header->sessionEpoch.load(std::memory_order_acquire))
+            {
+                slot.status = VST3_BRIDGE_SLOT_OK;
+                header->pluginReady.store(processed ? 1u : 0u, std::memory_order_release);
+                header->pluginLatency.store(processed ? engine.getPluginLatencySamples() : 0u,
+                                            std::memory_order_release);
+            }
+            header->processedBlocks.fetch_add(1, std::memory_order_relaxed);
+        }
+        catch (...)
+        {
+            slot.status = VST3_BRIDGE_SLOT_BYPASS;
+            header->pluginReady.store(0, std::memory_order_release);
+            header->pluginLatency.store(0, std::memory_order_release);
+        }
+    }
 
     DWORD WINAPI audioThreadMain(void* parameter)
     {
         auto* context = static_cast<AudioContext*>(parameter);
+        auto* header = context->header;
         HANDLE waits[] = { context->shutdownEvent, context->requestEvent };
-        std::array<std::int32_t, VST3_BRIDGE_IPC_MAX_CHANNELS
-                                 * VST3_BRIDGE_IPC_QUANTUM_FRAMES> pcm {};
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        std::vector<std::int32_t> pcm(vst3BridgeIpcSlotSamples());
+        const auto threadInfo = boostAudioThread();
+        LARGE_INTEGER qpcFrequency {};
+        QueryPerformanceFrequency(&qpcFrequency);
+
+        bridgelog::writef("host", "Audio thread ready: priority %d, MMCSS %s",
+                          static_cast<int>(threadInfo & 0xff) - 16, (threadInfo & 0x100) ? "Pro Audio" : "not available");
+        if (headerMatches(header))
+        {
+            header->hostThreadInfo.store(threadInfo, std::memory_order_release);
+            header->hostAudioReady.store(1, std::memory_order_release);
+        }
 
         while (true)
         {
             const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-            if (result == WAIT_OBJECT_0)
-                break;
             if (result != WAIT_OBJECT_0 + 1)
                 break;
 
-            auto* header = context->header;
-            if (header == nullptr || header->magic != VST3_BRIDGE_IPC_MAGIC
-                || header->version != VST3_BRIDGE_IPC_VERSION
-                || header->slotCount != VST3_BRIDGE_IPC_SLOT_COUNT
-                || header->quantumFrames != VST3_BRIDGE_IPC_QUANTUM_FRAMES
-                || header->maxChannels != VST3_BRIDGE_IPC_MAX_CHANNELS)
-            {
+            if (!headerMatches(header))
                 continue;
-            }
 
             while (true)
             {
@@ -111,75 +199,20 @@ namespace
                                                         std::memory_order_acquire))
                     continue;
 
-                auto* const slotInput = vst3BridgeIpcSlotInput(header, static_cast<std::uint32_t>(requestSlot));
-                auto* const slotOutput = vst3BridgeIpcSlotOutput(header, static_cast<std::uint32_t>(requestSlot));
-                const auto slotEpoch = header->sessionEpoch.load(std::memory_order_acquire);
-                const bool valid = slot.numFrames == VST3_BRIDGE_IPC_QUANTUM_FRAMES
-                    && slot.numChannels > 0 && slot.numChannels <= VST3_BRIDGE_IPC_MAX_CHANNELS
-                    && slot.sampleRate > 0 && slot.epoch == slotEpoch;
-                if (!valid)
-                {
-                    slot.status = VST3_BRIDGE_SLOT_BYPASS;
-                    header->staleBlocks.fetch_add(1, std::memory_order_relaxed);
-                }
-                else
-                {
-                    try
-                    {
-                        const auto channels = static_cast<int>(slot.numChannels);
-                        const auto frames = static_cast<int>(slot.numFrames);
-                        for (int channel = 0; channel < channels; ++channel)
-                            for (int frame = 0; frame < frames; ++frame)
-                            {
-                                const auto sample = std::clamp(
-                                    slotInput[static_cast<std::size_t>(channel) * frames + frame],
-                                    -1.0, 1.0);
-                                pcm[static_cast<std::size_t>(frame) * channels + channel] =
-                                    static_cast<std::int32_t>(sample * 2147483647.0);
-                            }
-
-                        VST3HostEngine::getInstance().processAudio(
-                            pcm.data(), frames, 32, channels, static_cast<int>(slot.sampleRate));
-                        const bool processed = VST3HostEngine::getInstance().wasLastAudioBlockProcessed();
-                        const bool currentEpoch = slot.epoch
-                            == header->sessionEpoch.load(std::memory_order_acquire);
-                        slot.status = processed && currentEpoch
-                            ? VST3_BRIDGE_SLOT_OK : VST3_BRIDGE_SLOT_BYPASS;
-                        if (currentEpoch)
-                        {
-                            header->pluginReady.store(processed ? 1u : 0u, std::memory_order_release);
-                            header->pluginLatency.store(
-                                processed ? VST3HostEngine::getInstance().getPluginLatencySamples() : 0u,
-                                std::memory_order_release);
-                        }
-                        for (int channel = 0; channel < channels; ++channel)
-                            for (int frame = 0; frame < frames; ++frame)
-                                slotOutput[static_cast<std::size_t>(channel) * frames + frame] =
-                                    pcm[static_cast<std::size_t>(frame) * channels + channel]
-                                    / 2147483648.0;
-                        header->processedBlocks.fetch_add(1, std::memory_order_relaxed);
-                        if (slot.epoch != header->sessionEpoch.load(std::memory_order_acquire))
-                        {
-                            slot.status = VST3_BRIDGE_SLOT_BYPASS;
-                            header->pluginReady.store(0, std::memory_order_release);
-                            header->pluginLatency.store(0, std::memory_order_release);
-                        }
-                    }
-                    catch (...)
-                    {
-                        slot.status = VST3_BRIDGE_SLOT_BYPASS;
-                        if (slot.epoch == header->sessionEpoch.load(std::memory_order_acquire))
-                        {
-                            header->pluginReady.store(0, std::memory_order_release);
-                            header->pluginLatency.store(0, std::memory_order_release);
-                        }
-                    }
-                }
-
+                LARGE_INTEGER begin {}, end {};
+                QueryPerformanceCounter(&begin);
+                processSlot(header, static_cast<std::uint32_t>(requestSlot), pcm);
+                QueryPerformanceCounter(&end);
+                slot.hostMicros = static_cast<std::uint32_t>(
+                    (end.QuadPart - begin.QuadPart) * 1000000 / qpcFrequency.QuadPart);
                 slot.state.store(VST3_BRIDGE_SLOT_RESPONSE, std::memory_order_release);
+                SetEvent(context->responseEvent);
             }
         }
 
+        if (headerMatches(header))
+            header->hostAudioReady.store(0, std::memory_order_release);
+        bridgelog::write("host", "Audio thread exiting");
         return 0;
     }
 }
@@ -196,6 +229,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     HANDLE mapping = parseHandle(argc, argv, L"--mapping");
     HANDLE requestEvent = parseHandle(argc, argv, L"--request");
+    HANDLE responseEvent = parseHandle(argc, argv, L"--response");
     HANDLE shutdownEvent = parseHandle(argc, argv, L"--shutdown");
     HANDLE showEvent = parseHandle(argc, argv, L"--show");
     HANDLE dspStartEvent = parseHandle(argc, argv, L"--dsp-start");
@@ -239,7 +273,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         return loaded ? 0 : 6;
     }
 
-    if (mapping == nullptr || requestEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr
+    if (mapping == nullptr || requestEvent == nullptr || responseEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr
         || dspStartEvent == nullptr || controlEvent == nullptr)
         return 2;
 
@@ -276,7 +310,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     VST3HostEngine::getInstance().writeLog("GUI preload completed");
     VST3HostEngine::getInstance().writeLog("Out-of-process host ready for audio and GUI events");
 
-    AudioContext context { header, requestEvent, shutdownEvent };
+    AudioContext context { header, requestEvent, responseEvent, shutdownEvent };
     HANDLE audioThread = CreateThread(nullptr, 0, audioThreadMain, &context, 0, nullptr);
     const auto showHostWindow = [&hostWindow]
     {

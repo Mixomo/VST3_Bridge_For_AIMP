@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "BridgeLog.h"
 #include "VST3HostEngine.h"
 #include "OutProcProtocol.h"
 #include <juce_core/juce_core.h>
@@ -16,6 +17,9 @@ static VST3HostEngine* s_instance = nullptr;
 namespace
 {
     constexpr int maxRealtimeBlockFrames = 32768;
+    // Matches VST3_BRIDGE_IPC_MAX_BLOCK_FRAMES, the largest block the
+    // out-of-process transport ever hands to processAudio().
+    constexpr int preferredPreparedBlockFrames = 4096;
     std::vector<std::unique_ptr<juce::AudioPluginInstance>>& getRetiredPlugins()
     {
         // Intentionally leaked for process lifetime. Some commercial VST3s keep
@@ -596,7 +600,9 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     if (sampleRate != requestedSampleRate.load(std::memory_order_acquire)
         || numChannels != requestedNumChannels.load(std::memory_order_acquire)
         || numFrames > requestedBlockSize.load(std::memory_order_acquire))
-        requestFormatPreparation(sampleRate, numChannels, numFrames);
+        // Prepare for the largest IPC block up front so callback-size jitter
+        // from AIMP never forces a re-prepare (and its bypass gap) mid-stream.
+        requestFormatPreparation(sampleRate, numChannels, juce::jmax(numFrames, preferredPreparedBlockFrames));
 
     const juce::ScopedTryLock sl(processLock);
     if (!sl.isLocked())
@@ -663,7 +669,10 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
 
             try
             {
-                if (!processBlockSafely(*pluginInstance, doubleBuffer, midiBuffer))
+                // The prepared buffer can be larger than this block: hand the plug-in
+                // a view of exactly numFrames, never the stale tail.
+                juce::AudioBuffer<double> block(doubleBuffer.getArrayOfWritePointers(), numChannels, numFrames);
+                if (!processBlockSafely(*pluginInstance, block, midiBuffer))
                 {
                     const auto failedPath = activePluginPath;
                     writeLog("Process block failed with Windows structured exception; bypassing bridge");
@@ -747,7 +756,10 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
 
             try
             {
-                if (!processBlockSafely(*pluginInstance, floatBuffer, midiBuffer))
+                // The prepared buffer can be larger than this block: hand the plug-in
+                // a view of exactly numFrames, never the stale tail.
+                juce::AudioBuffer<float> block(floatBuffer.getArrayOfWritePointers(), numChannels, numFrames);
+                if (!processBlockSafely(*pluginInstance, block, midiBuffer))
                 {
                     const auto failedPath = activePluginPath;
                     writeLog("Process block failed with Windows structured exception; bypassing bridge");
@@ -999,6 +1011,7 @@ void VST3HostEngine::writeLog(const juce::String& message) const
     const auto utf8 = message.toRawUTF8();
     OutputDebugStringA(utf8);
     OutputDebugStringA("\n");
+    bridgelog::write("host", utf8);
 }
 
 void VST3HostEngine::saveState()

@@ -3,6 +3,7 @@
 
 #include "OutProcClient.h"
 #include "BridgeRuntime.h"
+#include "BridgeLog.h"
 
 #include <cstring>
 #include <exception>
@@ -35,12 +36,24 @@ namespace
         return static_cast<int>(bridge::currentArchitecture());
     }
 
-    bool startupNeedsSmokeTest(const bridge::RuntimePaths& paths)
+    // Returns the plug-in a start-up smoke test must cover, or an empty string.
+    juce::String startupSmokeTestTarget(const bridge::RuntimePaths& paths)
     {
         const auto settings = bridge::ConfigStore(paths).load();
-        if (settings.startupMode == "none") return false;
+        if (settings.startupMode == "none") return {};
         const auto selected = settings.activePlugin;
-        return selected.path.isNotEmpty() && selected.resolve(paths).exists();
+        if (selected.path.isEmpty()) return {};
+        const auto file = selected.resolve(paths);
+        return file.exists() ? file.getFullPathName() : juce::String();
+    }
+
+    // The smoke test launches a complete host and waits for it to exit
+    // (~1.5-2 s). It only needs to pass once per AIMP process for a given
+    // plug-in; repeating it on every DSP restart blocked AIMP each time.
+    juce::String& smokeTestPassedFor()
+    {
+        static juce::String passed;
+        return passed;
     }
 
     bool runStartupSmokeTest(const std::wstring& hostPath, const bridge::RuntimePaths& paths)
@@ -56,16 +69,27 @@ namespace
                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup, &process))
             return false;
         CloseHandle(process.hThread);
+        const auto smokeStart = GetTickCount64();
+        bridgelog::writef("aimp", "Smoke test started (pid %lu)", process.dwProcessId);
         const auto wait = WaitForSingleObject(process.hProcess, 5000);
         if (wait != WAIT_OBJECT_0)
         {
+            // Still running after 5 s: the plug-in is slow to load (some take
+            // several seconds), not crashing. Treating that as a failure forced
+            // every slow plug-in into safe-start bypass, so it never processed
+            // audio in AIMP. Only a crash or an error exit selects safe start.
             TerminateProcess(process.hProcess, 8);
             WaitForSingleObject(process.hProcess, 1000);
+            CloseHandle(process.hProcess);
+            bridgelog::write("aimp", "Smoke test still running after 5000 ms: slow plug-in load, treated as passed");
+            return true;
         }
         DWORD exitCode = 8;
         GetExitCodeProcess(process.hProcess, &exitCode);
         CloseHandle(process.hProcess);
-        return wait == WAIT_OBJECT_0 && exitCode == 0;
+        bridgelog::writef("aimp", "Smoke test finished in %llu ms, exit code 0x%08lX -> %s",
+                          GetTickCount64() - smokeStart, exitCode, exitCode == 0 ? "passed" : "FAILED (safe start)");
+        return exitCode == 0;
     }
 }
 
@@ -82,6 +106,7 @@ bool OutProcClient::start(HMODULE bridgeModule)
     }
     catch (const std::exception&)
     {
+        bridgelog::write("aimp", "Start failed: audio client allocation");
         return false;
     }
     submittedBlocks = 0;
@@ -94,23 +119,21 @@ bool OutProcClient::start(HMODULE bridgeModule)
     clientCallbacksOver3ms = 0;
     emergencyBypassBlocks = 0;
     requestSequence = 0;
-    lastUnderruns = 0;
-    lastOverruns = 0;
-    lastStaleBlocks = 0;
-    lastProcessedBlocks = 0;
 
     SECURITY_ATTRIBUTES attributes { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
     mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &attributes, PAGE_READWRITE, 0,
                                  static_cast<DWORD>(vst3BridgeIpcMappingSize()), nullptr);
     requestEvent = createInheritableEvent(false);
+    responseEvent = createInheritableEvent(false);
     shutdownEvent = createInheritableEvent(true);
     showEvent = createInheritableEvent(false);
     dspStartEvent = createInheritableEvent(false);
     controlEvent = createInheritableEvent(false);
 
-    if (mapping == nullptr || requestEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr
+    if (mapping == nullptr || requestEvent == nullptr || responseEvent == nullptr || shutdownEvent == nullptr || showEvent == nullptr
         || dspStartEvent == nullptr || controlEvent == nullptr)
     {
+        bridgelog::writef("aimp", "Start failed: IPC objects (error %lu)", GetLastError());
         closeHandles();
         return false;
     }
@@ -136,12 +159,22 @@ bool OutProcClient::start(HMODULE bridgeModule)
     stopping = false;
     const auto architecture = initialHostArchitecture(paths);
     const auto hostPath = getHostPath(module, architecture);
-    const bool safeStart = startupNeedsSmokeTest(paths) && !runStartupSmokeTest(hostPath, paths);
+    const auto smokeTarget = startupSmokeTestTarget(paths) + "|" + juce::String(hostPath.c_str());
+    bool safeStart = false;
+    if (smokeTarget != "|" + juce::String(hostPath.c_str()) && smokeTarget != smokeTestPassedFor())
+    {
+        safeStart = !runStartupSmokeTest(hostPath, paths);
+        smokeTestPassedFor() = safeStart ? juce::String() : smokeTarget;
+    }
+    else
+        bridgelog::write("aimp", "Smoke test skipped (no plug-in selected, or already passed in this session)");
     if (!launchHost(architecture, safeStart))
     {
+        bridgelog::write("aimp", "Start failed: host launch");
         closeHandles();
         return false;
     }
+    diagLog.start();
     controlThread = CreateThread(nullptr, 0, controlThreadEntry, this, 0, nullptr);
     if (controlThread == nullptr)
     {
@@ -162,6 +195,7 @@ bool OutProcClient::launchHost(int architecture, bool safeStart)
     command << quote(hostPath)
             << L" --mapping " << reinterpret_cast<std::uintptr_t>(mapping)
             << L" --request " << reinterpret_cast<std::uintptr_t>(requestEvent)
+            << L" --response " << reinterpret_cast<std::uintptr_t>(responseEvent)
             << L" --shutdown " << reinterpret_cast<std::uintptr_t>(shutdownEvent)
             << L" --show " << reinterpret_cast<std::uintptr_t>(showEvent)
             << L" --dsp-start " << reinterpret_cast<std::uintptr_t>(dspStartEvent)
@@ -178,11 +212,15 @@ bool OutProcClient::launchHost(int architecture, bool safeStart)
                                         nullptr, nullptr, &startup, &processInfo);
     if (!created)
     {
+        bridgelog::writef("aimp", "CreateProcess failed (error %lu): %S", GetLastError(), hostPath.c_str());
         return false;
     }
 
     CloseHandle(processInfo.hThread);
     processHandle = processInfo.hProcess;
+    bridgelog::writef("aimp", "Host launched: pid %lu, %s, %s: %S", processInfo.dwProcessId,
+                      architecture == static_cast<int>(bridge::Architecture::x86) ? "x86" : "x64",
+                      safeStart ? "SAFE START (plug-in bypassed)" : "normal start", hostPath.c_str());
 
     jobHandle = CreateJobObjectW(nullptr, nullptr);
     if (jobHandle != nullptr)
@@ -203,6 +241,7 @@ bool OutProcClient::launchHost(int architecture, bool safeStart)
 
 void OutProcClient::stop()
 {
+    diagLog.stop();
     stopping = true;
     if (controlEvent != nullptr) SetEvent(controlEvent);
     stopHost();
@@ -215,10 +254,21 @@ void OutProcClient::stopHost()
     if (shutdownEvent != nullptr) SetEvent(shutdownEvent);
     if (processHandle != nullptr)
     {
+        const auto stopStart = GetTickCount64();
+        DWORD exitCode = STILL_ACTIVE;
+        GetExitCodeProcess(processHandle, &exitCode);
+        if (exitCode != STILL_ACTIVE)
+            bridgelog::writef("aimp", "Host had already exited (exit code 0x%08lX)", exitCode);
         if (WaitForSingleObject(processHandle, 1500) != WAIT_OBJECT_0)
         {
             TerminateProcess(processHandle, 9);
             WaitForSingleObject(processHandle, 1000);
+            bridgelog::write("aimp", "Host did not exit within 1500 ms; terminated");
+        }
+        else if (exitCode == STILL_ACTIVE)
+        {
+            GetExitCodeProcess(processHandle, &exitCode);
+            bridgelog::writef("aimp", "Host exited in %llu ms (exit code 0x%08lX)", GetTickCount64() - stopStart, exitCode);
         }
         CloseHandle(processHandle);
         processHandle = nullptr;
@@ -245,8 +295,10 @@ void OutProcClient::controlLoop()
         const auto architecture = safeRestart
             ? static_cast<int>(header->hostArchitecture)
             : static_cast<int>(requested);
+        bridgelog::writef("aimp", "Host restart requested: %s", safeRestart ? "safe restart (Reload Bridge)" : "architecture switch");
         stopHost();
         ResetEvent(shutdownEvent);
+        header->hostAudioReady.store(0, std::memory_order_release);
         header->sessionEpoch.fetch_add(1, std::memory_order_acq_rel);
         for (auto& slot : header->slots)
         {
@@ -275,29 +327,41 @@ bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int
     if (header == nullptr)
         return false;
 
-    const auto previousSequence = requestSequence;
-    const auto submitted = audioClient.process(samples, numFrames, bitsPerSample, numChannels,
-                                               sampleRate, header, requestSequence);
-    const auto submittedCount = requestSequence - previousSequence;
-    if (submitted)
+    std::int32_t firstRaw = 0;
+    // Frames whose every channel is exactly zero (16-bit only; diagnostics).
+    auto countZeroFrames = [&]() -> std::uint32_t
     {
-        SetEvent(requestEvent);
-        submittedBlocks.fetch_add(submittedCount, std::memory_order_relaxed);
+        if (bitsPerSample != 16)
+            return 0;
+        const auto* pcm16 = static_cast<const std::int16_t*>(samples);
+        std::uint32_t zeros = 0;
+        for (int f = 0; f < numFrames; ++f)
+        {
+            bool zero = true;
+            for (int c = 0; c < numChannels && zero; ++c)
+                zero = pcm16[static_cast<std::size_t>(f) * numChannels + c] == 0;
+            zeros += zero ? 1u : 0u;
+        }
+        return zeros;
+    };
+    std::uint32_t zeroIn = 0;
+    if (diagLog.isEnabled())
+    {
+        std::memcpy(&firstRaw, samples, static_cast<std::size_t>((std::min)(4, (std::max)(1, bitsPerSample / 8))));
+        zeroIn = countZeroFrames();
     }
 
-    const auto underruns = header->underruns.load(std::memory_order_relaxed);
-    const auto overruns = header->overruns.load(std::memory_order_relaxed);
-    const auto stale = header->staleBlocks.load(std::memory_order_relaxed);
-    const auto completed = header->processedBlocks.load(std::memory_order_relaxed);
-    missedBlocks.fetch_add(underruns - lastUnderruns, std::memory_order_relaxed);
-    emergencyBypassBlocks.fetch_add(underruns - lastUnderruns, std::memory_order_relaxed);
-    queueFullBlocks.fetch_add(overruns - lastOverruns, std::memory_order_relaxed);
-    staleBlocks.fetch_add(stale - lastStaleBlocks, std::memory_order_relaxed);
-    completedBlocks.fetch_add(completed - lastProcessedBlocks, std::memory_order_relaxed);
-    lastUnderruns = underruns;
-    lastOverruns = overruns;
-    lastStaleBlocks = stale;
-    lastProcessedBlocks = completed;
+    const auto processed = audioClient.process(samples, numFrames, bitsPerSample, numChannels,
+                                               sampleRate, header, requestSequence,
+                                               requestEvent, responseEvent);
+
+    const auto& stats = audioClient.getStats();
+    submittedBlocks.store(stats.submitted, std::memory_order_relaxed);
+    completedBlocks.store(stats.completed, std::memory_order_relaxed);
+    missedBlocks.store(stats.timedOut, std::memory_order_relaxed);
+    staleBlocks.store(stats.rejected, std::memory_order_relaxed);
+    queueFullBlocks.store(stats.hostBusy, std::memory_order_relaxed);
+    emergencyBypassBlocks.store(stats.dryFrames, std::memory_order_relaxed);
 
     LARGE_INTEGER endTicks {};
     QueryPerformanceCounter(&endTicks);
@@ -314,7 +378,34 @@ bool OutProcClient::process(void* samples, int numFrames, int bitsPerSample, int
     if (elapsedMicros > 3000)
         clientCallbacksOver3ms.fetch_add(1, std::memory_order_relaxed);
 
-    return submitted;
+    if (diagLog.isEnabled())
+    {
+        const auto& call = audioClient.getLastCall();
+        DiagEntry entry {};
+        entry.qpc = startTicks.QuadPart;
+        entry.threadId = GetCurrentThreadId();
+        entry.threadPriority = GetThreadPriority(GetCurrentThread());
+        entry.frames = static_cast<std::uint32_t>(numFrames);
+        entry.sampleRate = static_cast<std::uint32_t>(sampleRate);
+        entry.bitsPerSample = static_cast<std::uint16_t>(bitsPerSample);
+        entry.channels = static_cast<std::uint16_t>(numChannels);
+        entry.blocks = call.blocks;
+        entry.wetBlocks = call.wetBlocks;
+        entry.callMicros = static_cast<std::uint32_t>(elapsedMicros);
+        entry.maxWaitMicros = static_cast<std::uint32_t>(call.maxWaitTicks * 1000000 / qpcFrequency);
+        entry.maxHostMicros = call.maxHostMicros;
+        entry.hostThreadInfo = header->hostThreadInfo.load(std::memory_order_relaxed);
+        entry.firstRawSample = firstRaw;
+        entry.dryFrames = call.dryFrames;
+        entry.resets = static_cast<std::uint32_t>(audioClient.getStats().resets);
+        entry.zeroOutFrames = countZeroFrames();
+        entry.zeroInFrames = zeroIn;
+        entry.timedOut = static_cast<std::uint32_t>(stats.timedOut);
+        entry.hostBusy = static_cast<std::uint32_t>(stats.hostBusy);
+        diagLog.push(entry);
+    }
+
+    return processed;
 }
 
 bool OutProcClient::showEditor()
@@ -340,7 +431,7 @@ void OutProcClient::closeHandles()
     if (header != nullptr)
         UnmapViewOfFile(header);
     header = nullptr;
-    for (auto* handle : { &mapping, &requestEvent, &shutdownEvent, &showEvent, &dspStartEvent,
+    for (auto* handle : { &mapping, &requestEvent, &responseEvent, &shutdownEvent, &showEvent, &dspStartEvent,
                           &controlEvent, &processHandle, &jobHandle })
     {
         if (*handle != nullptr)
