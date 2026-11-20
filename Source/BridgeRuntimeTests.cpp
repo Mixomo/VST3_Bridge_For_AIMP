@@ -98,8 +98,8 @@ int main()
     assert(currentArchitecture() == (sizeof(void*) == 8 ? Architecture::x64 : Architecture::x86));
     assert(sizeof(VST3BridgeIpcSlot) == 64);
     assert(offsetof(VST3BridgeIpcSlot, sequence) == 32);
-    static_assert(sizeof(VST3BridgeIpcHeader) == 384);
-    assert(VST3_BRIDGE_IPC_VERSION == 8);
+    static_assert(sizeof(VST3BridgeIpcHeader) == 128 + VST3_BRIDGE_IPC_SLOT_COUNT * sizeof(VST3BridgeIpcSlot));
+    static_assert(VST3_BRIDGE_IPC_VERSION == 10);
     const VST3BridgeIpcHeader ipcHeader {};
     assert(ipcHeader.safeRestartRequested.load() == 0);
     root.deleteRecursively();

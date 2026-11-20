@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "BridgeLog.h"
 #include "VST3HostEngine.h"
 #include "OutProcProtocol.h"
 #include <juce_core/juce_core.h>
@@ -16,6 +17,10 @@ static VST3HostEngine* s_instance = nullptr;
 
 namespace
 {
+    // Matches VST3_BRIDGE_IPC_MAX_BLOCK_FRAMES, the largest block the
+    // out-of-process transport ever hands to processAudio().
+    constexpr int preferredPreparedBlockFrames = 4096;
+
     std::vector<std::unique_ptr<juce::AudioPluginInstance>>& getRetiredPlugins()
     {
         // Intentionally leaked for process lifetime. Some commercial VST3s keep
@@ -708,7 +713,9 @@ int VST3HostEngine::processAudio(void* samples, int numFrames, int bps, int numC
     if (bridge::rackNeedsPreparation(pluginPrepared, currentSampleRate, currentNumChannels, currentBlockSize,
                                      sampleRate, numChannels, numFrames))
     {
-        pluginPrepared = preparePlugin(sampleRate, numChannels, numFrames);
+        // Prepare for the largest IPC block up front so callback-size jitter
+        // from AIMP never forces another re-prepare mid-stream.
+        pluginPrepared = preparePlugin(sampleRate, numChannels, juce::jmax(numFrames, preferredPreparedBlockFrames));
     }
 
     if (!pluginPrepared)
@@ -866,6 +873,7 @@ void VST3HostEngine::writeLog(const juce::String& message) const
     const auto utf8 = message.toRawUTF8();
     OutputDebugStringA(utf8);
     OutputDebugStringA("\n");
+    bridgelog::write("rack-host", utf8);
 }
 
 void VST3HostEngine::saveState()

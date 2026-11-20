@@ -3,6 +3,7 @@
 #include <mutex>
 #include <cstdio>
 #include "BridgeRuntime.h"
+#include "BridgeLog.h"
 
 #ifndef AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN
 #define AIMP_VST3_BRIDGE_ENABLE_AIMP_PLUGIN 1
@@ -48,6 +49,7 @@ namespace
     {
         OutputDebugStringA(message);
         OutputDebugStringA("\n");
+        bridgelog::write("rack-aimp", message);
     }
 
     bool StartRuntime()
@@ -98,6 +100,76 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_runtimeMutex);
         return g_runtimeRefs > 0 && g_outProcClient.isRunning();
+    }
+
+    // AIMP stops and restarts the DSP (Quit -> Init) when the output device,
+    // buffer size or sample rate changes. Stopping the host takes ~0.5-1.5 s
+    // and starting a new one ~2 s, all on AIMP's thread, which was heard as a
+    // mute after every buffer change. DspQuit therefore only schedules the stop:
+    // if DspInit follows within the grace period the running host is reused.
+    constexpr DWORD kDeferredStopMs = 4000;
+    std::mutex g_deferMutex;
+    HANDLE g_cancelStopEvent = nullptr;
+    bool g_stopPending = false;
+    bool g_dspActive = false;
+
+    DWORD WINAPI DeferredStopThread(void* module)
+    {
+        const bool cancelled = WaitForSingleObject(g_cancelStopEvent, kDeferredStopMs) == WAIT_OBJECT_0;
+        {
+            std::lock_guard<std::mutex> lock(g_deferMutex);
+            g_stopPending = false;
+            // Decide and stop under the lock so a concurrent DspInit either
+            // reuses the host (cancelled) or waits and starts a fresh one.
+            if (!cancelled && !g_dspActive)
+            {
+                WriteDebugLog("Deferred stop: no DSP restart within grace period");
+                StopRuntime();
+            }
+        }
+        // The thread pinned the module; release it as the very last step.
+        FreeLibraryAndExitThread(static_cast<HMODULE>(module), 0);
+    }
+
+    void ScheduleDeferredStop()
+    {
+        std::lock_guard<std::mutex> lock(g_deferMutex);
+        g_dspActive = false;
+        if (g_cancelStopEvent == nullptr)
+            g_cancelStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (g_cancelStopEvent == nullptr)
+        {
+            StopRuntime();
+            return;
+        }
+        ResetEvent(g_cancelStopEvent);
+        if (g_stopPending)
+            return;
+
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                reinterpret_cast<LPCWSTR>(&DeferredStopThread), &self))
+        {
+            StopRuntime();
+            return;
+        }
+        HANDLE thread = CreateThread(nullptr, 0, DeferredStopThread, self, 0, nullptr);
+        if (thread == nullptr)
+        {
+            FreeLibrary(self);
+            StopRuntime();
+            return;
+        }
+        CloseHandle(thread);
+        g_stopPending = true;
+    }
+
+    void MarkDspActive()
+    {
+        std::lock_guard<std::mutex> lock(g_deferMutex);
+        g_dspActive = true;
+        if (g_cancelStopEvent != nullptr)
+            SetEvent(g_cancelStopEvent);
     }
 
     void ShowHostConfig()
@@ -225,7 +297,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         g_hInst = hModule;
-        WriteDebugLog("DllMain attach");
+        wchar_t modulePath[MAX_PATH] {};
+        GetModuleFileNameW(hModule, modulePath, MAX_PATH);
+        bridgelog::writef("rack-aimp", "DllMain attach: %S", modulePath);
+        OutputDebugStringA("DllMain attach\n");
         // Prevent per-thread DllMain calls — reduces risk of
         // teardown races when JUCE threads are running.
         DisableThreadLibraryCalls(hModule);
@@ -378,15 +453,26 @@ static void __cdecl DspConfig(winampDSPModule*)
 
 static int __cdecl DspInit(winampDSPModule* thisMod)
 {
-    WriteDebugLog("DspInit called");
+    const auto initStart = GetTickCount64();
+    bridgelog::writef("rack-aimp", "DspInit called (thread %lu, priority %d)", GetCurrentThreadId(),
+                      GetThreadPriority(GetCurrentThread()));
     if (thisMod == nullptr)
         return 1;
-
-    if (!StartRuntime())
-        return 1;
+    struct InitTimer
+    {
+        ULONGLONG start;
+        ~InitTimer() { bridgelog::writef("rack-aimp", "DspInit returned after %llu ms", GetTickCount64() - start); }
+    } initTimer { initStart };
 
 #if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+    MarkDspActive();
+    if (!StartRuntime())
+        return 1;
+    g_outProcClient.restartStream();
     g_outProcClient.notifyDspStarted();
+#else
+    if (!StartRuntime())
+        return 1;
 #endif
 
     thisMod->userData = reinterpret_cast<void*>(1);
@@ -437,12 +523,16 @@ static int __cdecl DspModifySamples(winampDSPModule* thisMod,
 
 static void __cdecl DspQuit(winampDSPModule* thisMod)
 {
-    WriteDebugLog("DspQuit called");
+    bridgelog::writef("rack-aimp", "DspQuit called (thread %lu)", GetCurrentThreadId());
     if (thisMod == nullptr || thisMod->userData == nullptr)
         return;
 
     thisMod->userData = nullptr;
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+    ScheduleDeferredStop();
+#else
     StopRuntime();
+#endif
 }
 
 static char g_dspModuleDescription[] = "VST3 Bridge Rack for AIMP - Mixomo";
@@ -496,6 +586,30 @@ winampDSPHeader* __cdecl winampDSPGetHeader()
     WriteDebugLog("winampDSPGetHeader called");
     return &g_dspHeader;
 }
+
+#if AIMP_VST3_BRIDGE_OUT_OF_PROCESS
+// Diagnostics for test harnesses: submitted, completed, timed out, host busy,
+// rejected, max client callback microseconds.
+extern "C" __declspec(dllexport)
+int __cdecl vst3BridgeGetTransportStats(unsigned long long* values, int count)
+{
+    if (values == nullptr || count <= 0)
+        return 0;
+    const unsigned long long stats[] = {
+        g_outProcClient.getSubmittedBlocks(),
+        g_outProcClient.getCompletedBlocks(),
+        g_outProcClient.getMissedBlocks(),
+        g_outProcClient.getQueueFullBlocks(),
+        g_outProcClient.getStaleBlocks(),
+        g_outProcClient.getMaxClientCallbackMicros(),
+        g_outProcClient.getDryFrames()
+    };
+    const int n = count < 7 ? count : 7;
+    for (int i = 0; i < n; ++i)
+        values[i] = stats[i];
+    return n;
+}
+#endif
 
 extern "C" __declspec(dllexport)
 winampDSPHeaderEx* __cdecl winampDSPGetHeader2()

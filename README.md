@@ -19,6 +19,15 @@ This branch is an independent rack product. It does not contain the single-plug-
 - Versioned atomic JSON configuration with portable and user-profile storage.
 - AIMP-inspired grey/orange interface, active-card highlighting, orange scrollbar and tooltips for every host control.
 
+## Changelog 2026-11-20 | 1.0.2
+
+- Fixed stutters, clicks, pops and mutes with current AIMP builds, including ASIO (issue #4). AIMP calls Winamp DSPs in bursts with DirectSound/WASAPI and from inside the driver callback with ASIO; the previous transport assumed neither. The rack now runs with a fixed ~40 ms slack: each callback hands its audio to the isolated rack host and plays the result for audio received ~40 ms earlier, so the ASIO callback normally never waits for the plug-ins and CPU spikes up to the slack are absorbed. Late audio falls back to dry audio on the same timeline with a short crossfade.
+- No mute on buffer, sample-rate or device changes: the rack host is kept alive for 4 s after AIMP stops the DSP and reused when it restarts; the start-up smoke test runs once per AIMP session per plug-in.
+- The host audio thread is registered with MMCSS ("Pro Audio"), and the rack is prepared for the largest IPC block up front.
+- Diagnostics (automatic): while AIMP runs, the rack writes to `%TEMP%`: an event log from AIMP's side (`vst3bridge_rack-aimp_*.log`: DSP start/stop with durations, host launch/exit, 10-second audio summaries), one per host process (`vst3bridge_rack-host_*.log`), and a per-callback timing CSV (`vst3bridge_rack-audio_*.csv`). Logs are size-capped and only the newest 40 files are kept. `%TEMP%\vst3bridge_nolog.flag` disables the event logs and `%TEMP%\vst3bridge_nodiag.flag` the CSV.
+- Updated to the AIMP SDK v5.40 release of 09.11.2026.
+- Added a warning against changing the output device, sample rate or ASIO buffer size while audio is playing (see Limitations).
+
 ## Changelog 2026-10-16 | 1.0.1
 
 - Added fixed 512-frame audio IPC quantums with latency-aligned wet/dry processing and stale-block invalidation when the stream format or host session changes.
@@ -166,7 +175,7 @@ Window geometry and Detached/Full Screen state are not persisted.
 ### Maintenance
 
 - **Open Config Folder** opens the active configuration directory.
-- **Copy Diagnostics** copies rack, architecture, path and plug-in information without opaque Base64 state. Diagnostic messages are available through the Windows debugger.
+- **Copy Diagnostics** copies rack, architecture, path and plug-in information without opaque Base64 state. Event logs and a per-callback audio timing CSV are written to `%TEMP%` (`vst3bridge_rack-*`); messages also go to the Windows debugger.
 - **Reset Scan Cache** clears fingerprints and quarantine while preserving the rack, known plug-ins and saved states.
 - **Forget All Plugins** clears the rack and scanned list. It never deletes `.vst3` files.
 
@@ -224,11 +233,14 @@ A failed recovery check starts the bridge in dry bypass and reports a warning wi
 > [!NOTE]
 > Audio cracks, pops, clicks, and stutters may occur during playback, especially when using audio devices in ASIO mode. These issues are external to the VST3 Bridge and can occur even when the bridge is disabled or no VST3 is loaded. They depend on factors such as your computer's CPU, audio device, sample rate and buffer size, as well as software-related factors including GPU drivers and background operating-system processes. On Windows, you can use [LatencyMon](https://www.resplendence.com/latencymon) to check which system components contribute most to latency.
 
+> [!WARNING]
+> **Do not change audio engine settings while audio is playing.** Changing the output device, sample rate or ASIO buffer size during playback (from AIMP's settings or the audio interface's control panel) is not recommended. AIMP does not always recover from a live device reset: it can stop requesting audio for several seconds, or request it slower than real time, which is heard as mutes, dropouts or "lagging" audio until AIMP is restarted. This also happens with the VST3 DSP disabled, and the rack's logs show AIMP stops calling the DSP during these periods. Stop playback first, change the setting, then re-select the output device in AIMP (or restart AIMP) before playing again.
+
 - Universal VST3 compatibility is not possible. Some plug-ins require DAW-specific transport, MIDI, sidechains, licensing services or GPU/WebView behavior.
 - A single rack chain cannot mix x86 and x64 VST3 instances.
 - Legacy system-DPI editors can remain imperfect on mixed-DPI systems. Scale-aware VST3/JUCE editors behave best.
 - A host can restore only data serialised by the VST3.
-- The asynchronous pipeline uses fixed 512-frame IPC quantums and a latency-aligned wet/dry path so AIMP's audio callback never waits for another process. Transport epochs invalidate stale blocks when the sample rate, channel count, callback size or host session changes.
+- The audio transport adds a fixed ~40 ms of latency (plus the VST3's own) so the isolated host can process ahead of AIMP's callback. With ASIO, AIMP's driver callback normally does not wait for the plug-in at all; with DirectSound/WASAPI, AIMP's buffering thread waits only for audio the host has not finished yet. If the host misses that window, the affected audio passes dry on the same timeline with a short crossfade.
 - Very high CPU or DPC latency can still starve the isolated host; bypass protects continuity but cannot create CPU time.
 
 ## Licensing And Credits
